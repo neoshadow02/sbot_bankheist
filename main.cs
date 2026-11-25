@@ -880,15 +880,15 @@ public class CPHInline
         {
             if (!string.IsNullOrEmpty(userId))
             {
-                object rawById = CPH.GetTwitchUserVarById<object>(userId, varName, true);
-                if (rawById != null && TryConvertToLong(rawById, out long parsedById))
+                string rawById = CPH.GetTwitchUserVarById<string>(userId, varName, true);
+                if (!string.IsNullOrEmpty(rawById) && TryConvertToLong(rawById, out long parsedById))
                     return parsedById;
             }
 
             if (!string.IsNullOrEmpty(userName))
             {
-                object rawByName = CPH.GetTwitchUserVar<object>(userName, varName, true);
-                if (rawByName != null && TryConvertToLong(rawByName, out long parsedByName))
+                string rawByName = CPH.GetTwitchUserVar<string>(userName, varName, true);
+                if (!string.IsNullOrEmpty(rawByName) && TryConvertToLong(rawByName, out long parsedByName))
                     return parsedByName;
             }
 
@@ -1769,18 +1769,18 @@ public class CPHInline
     {
         try
         {
-            object raw = CPH.GetGlobalVar<object>(key, true);
-            if (raw != null)
+            string raw = CPH.GetGlobalVar<string>(key, true);
+            if (!string.IsNullOrEmpty(raw))
             {
-                string val = raw.ToString().Trim();
+                string val = raw.Trim();
                 if (!string.IsNullOrEmpty(val))
                     return val;
             }
 
-            object rawNonPersisted = CPH.GetGlobalVar<object>(key, false);
-            if (rawNonPersisted != null)
+            string rawNonPersisted = CPH.GetGlobalVar<string>(key, false);
+            if (!string.IsNullOrEmpty(rawNonPersisted))
             {
-                string val = rawNonPersisted.ToString().Trim();
+                string val = rawNonPersisted.Trim();
                 if (!string.IsNullOrEmpty(val))
                     return val;
             }
@@ -1857,8 +1857,8 @@ public class CPHInline
                 CPH.LogWarn($"[Bankheist] Invalid long argument '{key}'='{argVal}', falling back.");
             }
 
-            object raw = CPH.GetGlobalVar<object>(key, true);
-            if (raw != null && TryConvertToLong(raw, out long parsedGlobal))
+            string raw = GetGlobalStringRaw(key);
+            if (!string.IsNullOrEmpty(raw) && TryConvertToLong(raw, out long parsedGlobal))
                 return parsedGlobal;
 
             CPH.SetGlobalVar(key, defaultValue, true);
@@ -1887,8 +1887,8 @@ public class CPHInline
                 CPH.LogWarn($"[Bankheist] Invalid int argument '{key}'='{argVal}', falling back.");
             }
 
-            object raw = CPH.GetGlobalVar<object>(key, true);
-            if (raw != null && TryConvertToInt(raw, out int parsedGlobal))
+            string raw = GetGlobalStringRaw(key);
+            if (!string.IsNullOrEmpty(raw) && TryConvertToInt(raw, out int parsedGlobal))
                 return parsedGlobal;
 
             CPH.SetGlobalVar(key, defaultValue, true);
@@ -1910,18 +1910,18 @@ public class CPHInline
             {
                 if (TryConvertToDouble(argVal, out double parsedArg))
                 {
-                    CPH.SetGlobalVar(key, parsedArg, true);
+                    CPH.SetGlobalVar(key, parsedArg.ToString(CultureInfo.InvariantCulture), true);
                     return parsedArg;
                 }
 
                 CPH.LogWarn($"[Bankheist] Invalid double argument '{key}'='{argVal}', falling back.");
             }
 
-            object raw = CPH.GetGlobalVar<object>(key, true);
-            if (raw != null && TryConvertToDouble(raw, out double parsedGlobal))
+            string raw = GetGlobalStringRaw(key);
+            if (!string.IsNullOrEmpty(raw) && TryConvertToDouble(raw, out double parsedGlobal))
                 return parsedGlobal;
 
-            CPH.SetGlobalVar(key, defaultValue, true);
+            CPH.SetGlobalVar(key, defaultValue.ToString(CultureInfo.InvariantCulture), true);
             return defaultValue;
         }
         catch (Exception ex)
@@ -1969,7 +1969,7 @@ public class CPHInline
             return;
 
         if (TryConvertToDouble(argVal, out double parsed))
-            CPH.SetGlobalVar(key, parsed, true);
+            CPH.SetGlobalVar(key, parsed.ToString(CultureInfo.InvariantCulture), true);
         else
             CPH.LogWarn($"[Bankheist] Invalid double argument '{key}'='{argVal}', keeping previous value.");
     }
