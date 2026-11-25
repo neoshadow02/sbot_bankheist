@@ -12,6 +12,12 @@ public class CPHInline
     // =========================================================================
     // CONSTANTS & MODELS
     // =========================================================================
+    private const string ScriptVersion = "2.2.0";
+    private const string GitHubLatestReleaseUrl = "https://api.github.com/repos/neoshadow02/sbot_bankheist/releases/latest";
+    private const string GitHubReleasesFallbackUrl = "https://github.com/neoshadow02/sbot_bankheist/releases/latest";
+    private const int UpdateCheckIntervalHours = 24;
+    private const int UpdateCheckTimeoutMs = 3000;
+
     private const string DefaultCommand = "!heist";
     private const string DefaultJoinTimerName = "[MINIGAME] Bankheist Multilingual - Timer - Join";
     private const string DefaultCooldownTimerName = "[MINIGAME] Bankheist Multilingual - Timer - Cooldown";
@@ -22,6 +28,10 @@ public class CPHInline
     private const string VarStartTimeIso = "heist_start_time_iso";
     private const string VarLastRunIso = "heist_last_run_iso";
     private const string VarUsedCommand = "heist_used_command";
+    private const string VarScriptVersion = "heist_script_version";
+    private const string VarLatestVersion = "heist_latest_version";
+    private const string VarUpdateAvailable = "heist_update_available";
+    private const string VarLastUpdateCheckIso = "heist_last_update_check_iso";
 
     private const string RoleBroadcaster = "broadcaster";
     private const string RoleMod = "mod";
@@ -40,7 +50,8 @@ public class CPHInline
         "heistMsgSuccess", "heistMsgPartial", "heistMsgFailed",
         "heistMsgStatusActive", "heistMsgStatusCooldown", "heistMsgStatusIdle",
         "heistMsgNobodySurvivors", "heistMsgNobodyCaught", "heistMsgPointsApiError",
-        "heistMsgStatusNotJoined"
+        "heistMsgStatusNotJoined",
+        "heistMsgUpdateAvailable", "heistMsgUpdateUpToDate", "heistMsgUpdateCheckFailed", "heistMsgUpdateDenied"
     };
 
     private sealed class HeistParticipant
@@ -64,7 +75,7 @@ public class CPHInline
         string lang = GetLanguage();
 
         // Sync any settings passed via Sub-Action arguments into persistent globals
-        // so timer-triggered methods (ExecuteHeist / ResetCooldown) always see fresh values
+        // so timer-triggered methods (ExecuteHeist / ResetCooldown / CheckForUpdate) always see fresh values
         SyncSettingsFromArgs(lang);
 
         // Setup trigger
@@ -74,6 +85,16 @@ public class CPHInline
             HandleSetupCommand(usedCommand, lang);
             return true;
         }
+
+        // Manual update / version check trigger (Broadcaster / Mod / Editor test)
+        if (rawInput == "update" || rawInput == "version")
+        {
+            HandleUpdateCommand(usedCommand, lang);
+            return true;
+        }
+
+        // Automatic cached update check (at most once every 24 hours)
+        TryRunScheduledUpdateCheck(usedCommand, lang);
 
         // Configuration
         string pointsVariable = GetConfigString("heistPointsVariable", "userPoints");
@@ -423,17 +444,38 @@ public class CPHInline
     }
 
     // =========================================================================
+    // ENTRY POINT 4: METHOD EXECUTE - Streamer.bot Started / manual update check
+    // =========================================================================
+    public bool CheckForUpdate()
+    {
+        if (!IsConfigBoolTrue("heistCheckForUpdates", true))
+            return true;
+
+        string lang = GetLanguage();
+        string usedCommand = CPH.GetGlobalVar<string>(VarUsedCommand, false);
+        if (string.IsNullOrEmpty(usedCommand))
+            usedCommand = DefaultCommand;
+
+        RunUpdateCheck(usedCommand, lang, isManualCommand: false);
+        return true;
+    }
+
+    // =========================================================================
     // COMMAND HANDLERS & STATE HELPERS
     // =========================================================================
-    private void HandleSetupCommand(string usedCommand, string lang)
+    private bool HasAdminPermission(out string userName)
     {
         string userId = GetArgString("userId");
-        string userName = GetArgString("user");
+        userName = GetArgString("user");
         bool isDirectEditorTest = string.IsNullOrEmpty(userId) && string.IsNullOrEmpty(userName);
         bool isBroadcaster = IsArgTrue("isBroadcaster") || IsArgTrue("isOwner");
         bool isMod = IsArgTrue("isMod") || IsArgTrue("isModerator");
+        return isBroadcaster || isMod || isDirectEditorTest;
+    }
 
-        if (!isBroadcaster && !isMod && !isDirectEditorTest)
+    private void HandleSetupCommand(string usedCommand, string lang)
+    {
+        if (!HasAdminPermission(out string userName))
         {
             string msgSetupDenied = Msg("heistMsgSetupDenied", lang);
             CPH.SendMessage(
@@ -444,7 +486,231 @@ public class CPHInline
             return;
         }
 
-        RunFullSetup(lang);
+        RunFullSetup(usedCommand, lang);
+    }
+
+    private void HandleUpdateCommand(string usedCommand, string lang)
+    {
+        if (!HasAdminPermission(out string userName))
+        {
+            string msgDenied = Msg("heistMsgUpdateDenied", lang);
+            CPH.SendMessage(
+                msgDenied
+                    .Replace("%user%", userName)
+                    .Replace("%command%", usedCommand),
+                true);
+            return;
+        }
+
+        RunUpdateCheck(usedCommand, lang, isManualCommand: true);
+    }
+
+    private void TryRunScheduledUpdateCheck(string usedCommand, string lang)
+    {
+        try
+        {
+            if (!IsConfigBoolTrue("heistCheckForUpdates", true))
+                return;
+
+            string rawLastCheck = GetGlobalStringRaw(VarLastUpdateCheckIso);
+            if (TryParseIsoUtc(rawLastCheck, out DateTime lastCheckUtc))
+            {
+                if ((DateTime.UtcNow - lastCheckUtc).TotalHours < UpdateCheckIntervalHours)
+                    return;
+            }
+
+            RunUpdateCheck(usedCommand, lang, isManualCommand: false);
+        }
+        catch (Exception ex)
+        {
+            CPH.LogWarn($"[Bankheist] Scheduled update check skipped: {ex.Message}");
+        }
+    }
+
+    private void RunUpdateCheck(string usedCommand, string lang, bool isManualCommand)
+    {
+        CPH.SetGlobalVar(VarScriptVersion, ScriptVersion, true);
+        CPH.SetGlobalVar(VarLastUpdateCheckIso, DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture), true);
+
+        try
+        {
+            string json = FetchLatestReleaseJson(GitHubLatestReleaseUrl, UpdateCheckTimeoutMs);
+            if (string.IsNullOrEmpty(json))
+            {
+                CPH.LogWarn($"[Bankheist] Update check failed (no response from GitHub). Current version: v{ScriptVersion}");
+                if (isManualCommand)
+                {
+                    string msgFailed = Msg("heistMsgUpdateCheckFailed", lang);
+                    SafeSendMessage(
+                        msgFailed
+                            .Replace("%currentVersion%", ScriptVersion)
+                            .Replace("%command%", usedCommand));
+                }
+                return;
+            }
+
+            JObject obj = JObject.Parse(json);
+            string tagName = obj["tag_name"] != null ? obj["tag_name"].ToString().Trim() : "";
+            string releaseUrl = obj["html_url"] != null ? obj["html_url"].ToString().Trim() : GitHubReleasesFallbackUrl;
+            if (string.IsNullOrEmpty(releaseUrl))
+                releaseUrl = GitHubReleasesFallbackUrl;
+
+            string cleanLatest = NormalizeVersionString(tagName);
+            if (string.IsNullOrEmpty(cleanLatest))
+            {
+                CPH.LogWarn($"[Bankheist] Update check returned empty tag_name. Current version: v{ScriptVersion}");
+                if (isManualCommand)
+                {
+                    string msgFailed = Msg("heistMsgUpdateCheckFailed", lang);
+                    SafeSendMessage(
+                        msgFailed
+                            .Replace("%currentVersion%", ScriptVersion)
+                            .Replace("%command%", usedCommand));
+                }
+                return;
+            }
+
+            bool updateAvailable = IsNewerVersion(ScriptVersion, cleanLatest);
+            CPH.SetGlobalVar(VarLatestVersion, cleanLatest, true);
+            CPH.SetGlobalVar(VarUpdateAvailable, updateAvailable ? "true" : "false", true);
+
+            if (updateAvailable)
+            {
+                CPH.LogWarn($"[Bankheist] Update available! Current: v{ScriptVersion} -> Latest: v{cleanLatest} | {releaseUrl}");
+
+                bool notifyChat = isManualCommand || IsConfigBoolTrue("heistUpdateNotifyChat", true);
+                if (notifyChat)
+                {
+                    string msgUpdate = Msg("heistMsgUpdateAvailable", lang);
+                    SafeSendMessage(
+                        msgUpdate
+                            .Replace("%currentVersion%", ScriptVersion)
+                            .Replace("%latestVersion%", cleanLatest)
+                            .Replace("%url%", releaseUrl)
+                            .Replace("%command%", usedCommand));
+                }
+            }
+            else
+            {
+                CPH.LogInfo($"[Bankheist] Up to date (v{ScriptVersion}, latest release: v{cleanLatest}).");
+                if (isManualCommand)
+                {
+                    string msgUpToDate = Msg("heistMsgUpdateUpToDate", lang);
+                    SafeSendMessage(
+                        msgUpToDate
+                            .Replace("%currentVersion%", ScriptVersion)
+                            .Replace("%latestVersion%", cleanLatest)
+                            .Replace("%url%", releaseUrl)
+                            .Replace("%command%", usedCommand));
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            CPH.LogWarn($"[Bankheist] Update check failed: {ex.Message}");
+            if (isManualCommand)
+            {
+                string msgFailed = Msg("heistMsgUpdateCheckFailed", lang);
+                SafeSendMessage(
+                    msgFailed
+                        .Replace("%currentVersion%", ScriptVersion)
+                        .Replace("%command%", usedCommand));
+            }
+        }
+    }
+
+    protected virtual string FetchLatestReleaseJson(string apiUrl, int timeoutMs)
+    {
+        try
+        {
+            try
+            {
+                ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+            }
+            catch
+            {
+                // Ignore if OS/runtime restricts manual TLS configuration
+            }
+
+            var request = (HttpWebRequest)WebRequest.Create(apiUrl);
+            request.Method = "GET";
+            request.Accept = "application/vnd.github+json";
+            request.UserAgent = "Streamer.bot-Bankheist/" + ScriptVersion;
+            request.Timeout = timeoutMs;
+            request.ReadWriteTimeout = timeoutMs;
+
+            using (var response = (HttpWebResponse)request.GetResponse())
+            using (var responseStream = response.GetResponseStream())
+            {
+                if (responseStream == null)
+                    return "";
+
+                using (var reader = new StreamReader(responseStream, Encoding.UTF8))
+                {
+                    return reader.ReadToEnd();
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            CPH.LogWarn($"[Bankheist] GitHub release check HTTP error: {ex.Message}");
+            return null;
+        }
+    }
+
+    private string NormalizeVersionString(string raw)
+    {
+        if (string.IsNullOrEmpty(raw))
+            return "";
+
+        string s = raw.Trim();
+        if (s.StartsWith("v", StringComparison.OrdinalIgnoreCase))
+            s = s.Substring(1);
+
+        int suffixIdx = s.IndexOfAny(new char[] { '-', '+' });
+        if (suffixIdx >= 0)
+            s = s.Substring(0, suffixIdx);
+
+        return s.Trim();
+    }
+
+    private bool IsNewerVersion(string currentRaw, string latestRaw)
+    {
+        string currentClean = NormalizeVersionString(currentRaw);
+        string latestClean = NormalizeVersionString(latestRaw);
+
+        if (Version.TryParse(currentClean, out Version currentVer) &&
+            Version.TryParse(latestClean, out Version latestVer))
+        {
+            return latestVer > currentVer;
+        }
+
+        return false;
+    }
+
+    private void SafeSendMessage(string message)
+    {
+        if (string.IsNullOrEmpty(message))
+            return;
+
+        try
+        {
+            CPH.SendMessage(message, true);
+        }
+        catch (Exception ex)
+        {
+            CPH.LogWarn($"[Bankheist] Could not send chat notification (Twitch chat may not be connected yet): {ex.Message}");
+        }
+    }
+
+    private bool IsConfigBoolTrue(string key, bool defaultValue)
+    {
+        string raw = GetConfigString(key, defaultValue ? "true" : "false").Trim().ToLowerInvariant();
+        if (raw == "true" || raw == "1" || raw == "yes")
+            return true;
+        if (raw == "false" || raw == "0" || raw == "no")
+            return false;
+        return defaultValue;
     }
 
     private void ProcessStatus(string usedCommand, int joinTimeSec, int cooldownSec, long minBet, long maxBet, string lang)
@@ -547,6 +813,8 @@ public class CPHInline
         SyncOptionalStringArg("heistStreamElementsJwt");
         SyncOptionalIntArg("heistPointsApiTimeoutMs");
         SyncOptionalStringArg("heistDebugApiErrors");
+        SyncOptionalStringArg("heistCheckForUpdates");
+        SyncOptionalStringArg("heistUpdateNotifyChat");
 
         // Handle heistWordPoints explicitly: non-empty persists, explicitly empty arg resets to language default
         if (CPH.TryGetArg("heistWordPoints", out object rawWordObj))
@@ -566,7 +834,7 @@ public class CPHInline
         }
     }
 
-    private void RunFullSetup(string lang)
+    private void RunFullSetup(string usedCommand, string lang)
     {
         CPH.SendMessage(Msg("heistMsgSetupStarted", lang), true);
 
@@ -590,6 +858,9 @@ public class CPHInline
         GetConfigString("heistStreamElementsJwt", "");
         GetConfigInt("heistPointsApiTimeoutMs", 7000);
         GetConfigString("heistDebugApiErrors", "false");
+        GetConfigString("heistCheckForUpdates", "true");
+        GetConfigString("heistUpdateNotifyChat", "true");
+        CPH.SetGlobalVar(VarScriptVersion, ScriptVersion, true);
 
         foreach (string key in MessageKeys)
         {
@@ -614,6 +885,9 @@ public class CPHInline
         StopTimer(cooldownTimerId, DefaultCooldownTimerName);
 
         CPH.SendMessage(Msg("heistMsgSetupCompleted", lang), true);
+
+        if (IsConfigBoolTrue("heistCheckForUpdates", true))
+            RunUpdateCheck(usedCommand, lang, isManualCommand: false);
     }
 
     private Dictionary<string, HeistParticipant> LoadParticipants()
@@ -1264,7 +1538,12 @@ public class CPHInline
 
     private string GetBuiltInMessage(string key, string lang)
     {
-        switch (NormalizeLanguage(lang))
+        string normalized = NormalizeLanguage(lang);
+        string updateMsg = GetBuiltInUpdateMessage(key, normalized);
+        if (!string.IsNullOrEmpty(updateMsg))
+            return updateMsg;
+
+        switch (normalized)
         {
             case "de":
                 return GetBuiltInDe(key);
@@ -1285,6 +1564,125 @@ public class CPHInline
             default:
                 return GetBuiltInEn(key);
         }
+    }
+
+    private string GetBuiltInUpdateMessage(string key, string lang)
+    {
+        if (key != "heistMsgUpdateAvailable" &&
+            key != "heistMsgUpdateUpToDate" &&
+            key != "heistMsgUpdateCheckFailed" &&
+            key != "heistMsgUpdateDenied")
+            return "";
+
+        switch (lang)
+        {
+            case "de":
+                switch (key)
+                {
+                    case "heistMsgUpdateAvailable":
+                        return "🔔 Bankheist-Update verfügbar! Aktuell: v%currentVersion% → Neu: v%latestVersion% | %url%";
+                    case "heistMsgUpdateUpToDate":
+                        return "✅ Bankheist ist auf dem neuesten Stand (v%currentVersion%).";
+                    case "heistMsgUpdateCheckFailed":
+                        return "⚠️ Update-Prüfung fehlgeschlagen (aktuell: v%currentVersion%). Details im Streamer.bot-Log.";
+                    case "heistMsgUpdateDenied":
+                        return "❌ %user%, du hast keine Berechtigung, den Update-Check für %command% auszuführen! (Nur Moderatoren/Broadcaster)";
+                }
+                break;
+            case "es":
+                switch (key)
+                {
+                    case "heistMsgUpdateAvailable":
+                        return "🔔 ¡Actualización de Bankheist disponible! Actual: v%currentVersion% → Nueva: v%latestVersion% | %url%";
+                    case "heistMsgUpdateUpToDate":
+                        return "✅ Bankheist está actualizado (v%currentVersion%).";
+                    case "heistMsgUpdateCheckFailed":
+                        return "⚠️ Error al comprobar actualizaciones (actual: v%currentVersion%). Revisa el registro de Streamer.bot.";
+                    case "heistMsgUpdateDenied":
+                        return "❌ %user%, no tienes permiso para comprobar actualizaciones de %command%. (Solo moderadores/broadcaster)";
+                }
+                break;
+            case "fr":
+                switch (key)
+                {
+                    case "heistMsgUpdateAvailable":
+                        return "🔔 Mise à jour Bankheist disponible ! Actuelle : v%currentVersion% → Nouvelle : v%latestVersion% | %url%";
+                    case "heistMsgUpdateUpToDate":
+                        return "✅ Bankheist est à jour (v%currentVersion%).";
+                    case "heistMsgUpdateCheckFailed":
+                        return "⚠️ Échec de la vérification de mise à jour (actuelle : v%currentVersion%). Voir les logs Streamer.bot.";
+                    case "heistMsgUpdateDenied":
+                        return "❌ %user%, tu n'as pas l'autorisation de vérifier les mises à jour pour %command% ! (Modérateurs/Broadcaster uniquement)";
+                }
+                break;
+            case "pt-br":
+                switch (key)
+                {
+                    case "heistMsgUpdateAvailable":
+                        return "🔔 Atualização do Bankheist disponível! Atual: v%currentVersion% → Nova: v%latestVersion% | %url%";
+                    case "heistMsgUpdateUpToDate":
+                        return "✅ O Bankheist está atualizado (v%currentVersion%).";
+                    case "heistMsgUpdateCheckFailed":
+                        return "⚠️ Falha ao verificar atualizações (atual: v%currentVersion%). Veja o log do Streamer.bot.";
+                    case "heistMsgUpdateDenied":
+                        return "❌ %user%, você não tem permissão para verificar atualizações de %command%! (Somente moderadores/broadcaster)";
+                }
+                break;
+            case "tr":
+                switch (key)
+                {
+                    case "heistMsgUpdateAvailable":
+                        return "🔔 Bankheist güncellemesi mevcut! Mevcut: v%currentVersion% → Yeni: v%latestVersion% | %url%";
+                    case "heistMsgUpdateUpToDate":
+                        return "✅ Bankheist güncel (v%currentVersion%).";
+                    case "heistMsgUpdateCheckFailed":
+                        return "⚠️ Güncelleme kontrolü başarısız (mevcut: v%currentVersion%). Detaylar Streamer.bot günlüğünde.";
+                    case "heistMsgUpdateDenied":
+                        return "❌ %user%, %command% güncelleme kontrolünü çalıştırma iznin yok! (Sadece moderatörler/yayıncı)";
+                }
+                break;
+            case "nl":
+                switch (key)
+                {
+                    case "heistMsgUpdateAvailable":
+                        return "🔔 Bankheist-update beschikbaar! Huidig: v%currentVersion% → Nieuw: v%latestVersion% | %url%";
+                    case "heistMsgUpdateUpToDate":
+                        return "✅ Bankheist is up-to-date (v%currentVersion%).";
+                    case "heistMsgUpdateCheckFailed":
+                        return "⚠️ Updatecontrole mislukt (huidig: v%currentVersion%). Bekijk het Streamer.bot-logboek.";
+                    case "heistMsgUpdateDenied":
+                        return "❌ %user%, je mag de updatecontrole voor %command% niet uitvoeren! (Alleen moderators/broadcaster)";
+                }
+                break;
+            case "pl":
+                switch (key)
+                {
+                    case "heistMsgUpdateAvailable":
+                        return "🔔 Dostępna aktualizacja Bankheist! Obecna: v%currentVersion% → Nowa: v%latestVersion% | %url%";
+                    case "heistMsgUpdateUpToDate":
+                        return "✅ Bankheist jest aktualny (v%currentVersion%).";
+                    case "heistMsgUpdateCheckFailed":
+                        return "⚠️ Sprawdzanie aktualizacji nie powiodło się (obecna: v%currentVersion%). Sprawdź log Streamer.bot.";
+                    case "heistMsgUpdateDenied":
+                        return "❌ %user%, nie masz uprawnień do sprawdzenia aktualizacji %command%! (Tylko moderatorzy/broadcaster)";
+                }
+                break;
+            default:
+                switch (key)
+                {
+                    case "heistMsgUpdateAvailable":
+                        return "🔔 Bankheist update available! Current: v%currentVersion% → Latest: v%latestVersion% | %url%";
+                    case "heistMsgUpdateUpToDate":
+                        return "✅ Bankheist is up to date (v%currentVersion%).";
+                    case "heistMsgUpdateCheckFailed":
+                        return "⚠️ Update check failed (current: v%currentVersion%). Check the Streamer.bot log for details.";
+                    case "heistMsgUpdateDenied":
+                        return "❌ %user%, you are not allowed to run the update check for %command%! (Moderators/Broadcaster only)";
+                }
+                break;
+        }
+
+        return "";
     }
 
     private string GetBuiltInDe(string key)
