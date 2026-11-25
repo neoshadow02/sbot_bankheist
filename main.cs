@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Net;
@@ -12,11 +13,14 @@ public class CPHInline
     // =========================================================================
     // CONSTANTS & MODELS
     // =========================================================================
-    private const string ScriptVersion = "2.2.0";
+    private const string ScriptVersion = "2.3.0";
     private const string GitHubLatestReleaseUrl = "https://api.github.com/repos/neoshadow02/sbot_bankheist/releases/latest";
     private const string GitHubReleasesFallbackUrl = "https://github.com/neoshadow02/sbot_bankheist/releases/latest";
+    private const string GitHubRawImportUrlTemplate = "https://raw.githubusercontent.com/neoshadow02/sbot_bankheist/{0}/import.sb";
+    private const string UpdateDownloadFolderName = "Bankheist_Updates";
     private const int UpdateCheckIntervalHours = 24;
     private const int UpdateCheckTimeoutMs = 3000;
+    private const int UpdateDownloadTimeoutMs = 10000;
 
     private const string DefaultCommand = "!heist";
     private const string DefaultJoinTimerName = "[MINIGAME] Bankheist Multilingual - Timer - Join";
@@ -51,7 +55,8 @@ public class CPHInline
         "heistMsgStatusActive", "heistMsgStatusCooldown", "heistMsgStatusIdle",
         "heistMsgNobodySurvivors", "heistMsgNobodyCaught", "heistMsgPointsApiError",
         "heistMsgStatusNotJoined",
-        "heistMsgUpdateAvailable", "heistMsgUpdateUpToDate", "heistMsgUpdateCheckFailed", "heistMsgUpdateDenied"
+        "heistMsgUpdateAvailable", "heistMsgUpdateUpToDate", "heistMsgUpdateCheckFailed", "heistMsgUpdateDenied",
+        "heistMsgUpdateDownloadSuccess", "heistMsgUpdateDownloadFileOnly", "heistMsgUpdateDownloadFailed", "heistMsgUpdateDownloadDenied"
     };
 
     private sealed class HeistParticipant
@@ -90,6 +95,13 @@ public class CPHInline
         if (rawInput == "update" || rawInput == "version")
         {
             HandleUpdateCommand(usedCommand, lang);
+            return true;
+        }
+
+        // Download latest import.sb locally + copy to clipboard (Broadcaster / Editor test only)
+        if (rawInput == "getupdate" || rawInput == "getupdate force")
+        {
+            HandleGetUpdateCommand(usedCommand, lang, rawInput == "getupdate force");
             return true;
         }
 
@@ -489,6 +501,15 @@ public class CPHInline
         RunFullSetup(usedCommand, lang);
     }
 
+    private bool HasBroadcasterPermission(out string userName)
+    {
+        string userId = GetArgString("userId");
+        userName = GetArgString("user");
+        bool isDirectEditorTest = string.IsNullOrEmpty(userId) && string.IsNullOrEmpty(userName);
+        bool isBroadcaster = IsArgTrue("isBroadcaster") || IsArgTrue("isOwner");
+        return isBroadcaster || isDirectEditorTest;
+    }
+
     private void HandleUpdateCommand(string usedCommand, string lang)
     {
         if (!HasAdminPermission(out string userName))
@@ -503,6 +524,211 @@ public class CPHInline
         }
 
         RunUpdateCheck(usedCommand, lang, isManualCommand: true);
+    }
+
+    private void HandleGetUpdateCommand(string usedCommand, string lang, bool forceDownload)
+    {
+        if (!HasBroadcasterPermission(out string userName))
+        {
+            string msgDenied = Msg("heistMsgUpdateDownloadDenied", lang);
+            CPH.SendMessage(
+                msgDenied
+                    .Replace("%user%", userName)
+                    .Replace("%command%", usedCommand),
+                true);
+            return;
+        }
+
+        string cleanLatest = ScriptVersion;
+        try
+        {
+            string json = FetchLatestReleaseJson(GitHubLatestReleaseUrl, UpdateCheckTimeoutMs);
+            if (string.IsNullOrEmpty(json))
+            {
+                CPH.LogWarn($"[Bankheist] Update download aborted: could not query GitHub latest release.");
+                string msgCheckFailed = Msg("heistMsgUpdateCheckFailed", lang);
+                SafeSendMessage(
+                    msgCheckFailed
+                        .Replace("%currentVersion%", ScriptVersion)
+                        .Replace("%command%", usedCommand));
+                return;
+            }
+
+            JObject obj = JObject.Parse(json);
+            string tagName = obj["tag_name"] != null ? obj["tag_name"].ToString().Trim() : "";
+            string releaseUrl = obj["html_url"] != null ? obj["html_url"].ToString().Trim() : GitHubReleasesFallbackUrl;
+            if (string.IsNullOrEmpty(releaseUrl))
+                releaseUrl = GitHubReleasesFallbackUrl;
+
+            cleanLatest = NormalizeVersionString(tagName);
+            if (string.IsNullOrEmpty(tagName) || string.IsNullOrEmpty(cleanLatest))
+            {
+                CPH.LogWarn("[Bankheist] Update download aborted: invalid tag_name from GitHub.");
+                string msgFailed = Msg("heistMsgUpdateDownloadFailed", lang);
+                SafeSendMessage(
+                    msgFailed
+                        .Replace("%latestVersion%", ScriptVersion)
+                        .Replace("%currentVersion%", ScriptVersion)
+                        .Replace("%command%", usedCommand));
+                return;
+            }
+
+            bool updateAvailable = IsNewerVersion(ScriptVersion, cleanLatest);
+            CPH.SetGlobalVar(VarScriptVersion, ScriptVersion, true);
+            CPH.SetGlobalVar(VarLatestVersion, cleanLatest, true);
+            CPH.SetGlobalVar(VarUpdateAvailable, updateAvailable ? "true" : "false", true);
+            CPH.SetGlobalVar(VarLastUpdateCheckIso, DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture), true);
+
+            if (!updateAvailable && !forceDownload)
+            {
+                string msgUpToDate = Msg("heistMsgUpdateUpToDate", lang);
+                SafeSendMessage(
+                    msgUpToDate
+                        .Replace("%currentVersion%", ScriptVersion)
+                        .Replace("%latestVersion%", cleanLatest)
+                        .Replace("%url%", releaseUrl)
+                        .Replace("%command%", usedCommand));
+                return;
+            }
+
+            string rawImportUrl = string.Format(CultureInfo.InvariantCulture, GitHubRawImportUrlTemplate, Uri.EscapeDataString(tagName));
+            string importContent = DownloadImportString(rawImportUrl, UpdateDownloadTimeoutMs);
+            if (string.IsNullOrEmpty(importContent))
+            {
+                CPH.LogError($"[Bankheist] Failed to download import.sb from {rawImportUrl}");
+                string msgFailed = Msg("heistMsgUpdateDownloadFailed", lang);
+                SafeSendMessage(
+                    msgFailed
+                        .Replace("%latestVersion%", cleanLatest)
+                        .Replace("%currentVersion%", ScriptVersion)
+                        .Replace("%command%", usedCommand));
+                return;
+            }
+
+            importContent = importContent.Trim();
+            if (!importContent.StartsWith("U0JBRR", StringComparison.Ordinal))
+            {
+                CPH.LogError("[Bankheist] Downloaded import.sb did not start with valid Streamer.bot SBAE header.");
+                string msgFailed = Msg("heistMsgUpdateDownloadFailed", lang);
+                SafeSendMessage(
+                    msgFailed
+                        .Replace("%latestVersion%", cleanLatest)
+                        .Replace("%currentVersion%", ScriptVersion)
+                        .Replace("%command%", usedCommand));
+                return;
+            }
+
+            string outputDir = GetUpdateOutputDirectory();
+            Directory.CreateDirectory(outputDir);
+            string safeVersion = cleanLatest.Replace("..", "").Replace("/", "").Replace("\\", "");
+            string fileName = "import_v" + safeVersion + ".sb";
+            string filePath = Path.Combine(outputDir, fileName);
+            File.WriteAllText(filePath, importContent, Encoding.ASCII);
+
+            bool copiedToClipboard = TryCopyToClipboard(importContent);
+            CPH.LogInfo($"[Bankheist] Downloaded v{cleanLatest} import.sb to '{filePath}' (clipboard: {copiedToClipboard}).");
+
+            string templateKey = copiedToClipboard ? "heistMsgUpdateDownloadSuccess" : "heistMsgUpdateDownloadFileOnly";
+            string msgResult = Msg(templateKey, lang);
+            SafeSendMessage(
+                msgResult
+                    .Replace("%latestVersion%", cleanLatest)
+                    .Replace("%currentVersion%", ScriptVersion)
+                    .Replace("%filePath%", filePath)
+                    .Replace("%url%", releaseUrl)
+                    .Replace("%command%", usedCommand));
+        }
+        catch (Exception ex)
+        {
+            CPH.LogError($"[Bankheist] Update download error: {ex.Message}");
+            string msgFailed = Msg("heistMsgUpdateDownloadFailed", lang);
+            SafeSendMessage(
+                msgFailed
+                    .Replace("%latestVersion%", cleanLatest)
+                    .Replace("%currentVersion%", ScriptVersion)
+                    .Replace("%command%", usedCommand));
+        }
+    }
+
+    protected virtual string DownloadImportString(string rawUrl, int timeoutMs)
+    {
+        try
+        {
+            try
+            {
+                ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+            }
+            catch
+            {
+                // Ignore if OS/runtime restricts manual TLS configuration
+            }
+
+            var request = (HttpWebRequest)WebRequest.Create(rawUrl);
+            request.Method = "GET";
+            request.UserAgent = "Streamer.bot-Bankheist/" + ScriptVersion;
+            request.Timeout = timeoutMs;
+            request.ReadWriteTimeout = timeoutMs;
+
+            using (var response = (HttpWebResponse)request.GetResponse())
+            using (var responseStream = response.GetResponseStream())
+            {
+                if (responseStream == null)
+                    return "";
+
+                using (var reader = new StreamReader(responseStream, Encoding.UTF8))
+                {
+                    return reader.ReadToEnd();
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            CPH.LogError($"[Bankheist] DownloadImportString failed for '{rawUrl}': {ex.Message}");
+            return null;
+        }
+    }
+
+    protected virtual string GetUpdateOutputDirectory()
+    {
+        return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, UpdateDownloadFolderName);
+    }
+
+    protected virtual bool TryCopyToClipboard(string text)
+    {
+        if (string.IsNullOrEmpty(text))
+            return false;
+
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "clip.exe",
+                UseShellExecute = false,
+                RedirectStandardInput = true,
+                CreateNoWindow = true
+            };
+
+            using (var process = Process.Start(startInfo))
+            {
+                if (process == null)
+                    return false;
+
+                using (StreamWriter writer = process.StandardInput)
+                {
+                    writer.Write(text);
+                }
+
+                if (!process.WaitForExit(3000))
+                    return false;
+
+                return process.ExitCode == 0;
+            }
+        }
+        catch (Exception ex)
+        {
+            CPH.LogWarn($"[Bankheist] Could not copy import string to clipboard: {ex.Message}");
+            return false;
+        }
     }
 
     private void TryRunScheduledUpdateCheck(string usedCommand, string lang)
@@ -1538,12 +1764,7 @@ public class CPHInline
 
     private string GetBuiltInMessage(string key, string lang)
     {
-        string normalized = NormalizeLanguage(lang);
-        string updateMsg = GetBuiltInUpdateMessage(key, normalized);
-        if (!string.IsNullOrEmpty(updateMsg))
-            return updateMsg;
-
-        switch (normalized)
+        switch (NormalizeLanguage(lang))
         {
             case "de":
                 return GetBuiltInDe(key);
@@ -1566,124 +1787,6 @@ public class CPHInline
         }
     }
 
-    private string GetBuiltInUpdateMessage(string key, string lang)
-    {
-        if (key != "heistMsgUpdateAvailable" &&
-            key != "heistMsgUpdateUpToDate" &&
-            key != "heistMsgUpdateCheckFailed" &&
-            key != "heistMsgUpdateDenied")
-            return "";
-
-        switch (lang)
-        {
-            case "de":
-                switch (key)
-                {
-                    case "heistMsgUpdateAvailable":
-                        return "🔔 Bankheist-Update verfügbar! Aktuell: v%currentVersion% → Neu: v%latestVersion% | %url%";
-                    case "heistMsgUpdateUpToDate":
-                        return "✅ Bankheist ist auf dem neuesten Stand (v%currentVersion%).";
-                    case "heistMsgUpdateCheckFailed":
-                        return "⚠️ Update-Prüfung fehlgeschlagen (aktuell: v%currentVersion%). Details im Streamer.bot-Log.";
-                    case "heistMsgUpdateDenied":
-                        return "❌ %user%, du hast keine Berechtigung, den Update-Check für %command% auszuführen! (Nur Moderatoren/Broadcaster)";
-                }
-                break;
-            case "es":
-                switch (key)
-                {
-                    case "heistMsgUpdateAvailable":
-                        return "🔔 ¡Actualización de Bankheist disponible! Actual: v%currentVersion% → Nueva: v%latestVersion% | %url%";
-                    case "heistMsgUpdateUpToDate":
-                        return "✅ Bankheist está actualizado (v%currentVersion%).";
-                    case "heistMsgUpdateCheckFailed":
-                        return "⚠️ Error al comprobar actualizaciones (actual: v%currentVersion%). Revisa el registro de Streamer.bot.";
-                    case "heistMsgUpdateDenied":
-                        return "❌ %user%, no tienes permiso para comprobar actualizaciones de %command%. (Solo moderadores/broadcaster)";
-                }
-                break;
-            case "fr":
-                switch (key)
-                {
-                    case "heistMsgUpdateAvailable":
-                        return "🔔 Mise à jour Bankheist disponible ! Actuelle : v%currentVersion% → Nouvelle : v%latestVersion% | %url%";
-                    case "heistMsgUpdateUpToDate":
-                        return "✅ Bankheist est à jour (v%currentVersion%).";
-                    case "heistMsgUpdateCheckFailed":
-                        return "⚠️ Échec de la vérification de mise à jour (actuelle : v%currentVersion%). Voir les logs Streamer.bot.";
-                    case "heistMsgUpdateDenied":
-                        return "❌ %user%, tu n'as pas l'autorisation de vérifier les mises à jour pour %command% ! (Modérateurs/Broadcaster uniquement)";
-                }
-                break;
-            case "pt-br":
-                switch (key)
-                {
-                    case "heistMsgUpdateAvailable":
-                        return "🔔 Atualização do Bankheist disponível! Atual: v%currentVersion% → Nova: v%latestVersion% | %url%";
-                    case "heistMsgUpdateUpToDate":
-                        return "✅ O Bankheist está atualizado (v%currentVersion%).";
-                    case "heistMsgUpdateCheckFailed":
-                        return "⚠️ Falha ao verificar atualizações (atual: v%currentVersion%). Veja o log do Streamer.bot.";
-                    case "heistMsgUpdateDenied":
-                        return "❌ %user%, você não tem permissão para verificar atualizações de %command%! (Somente moderadores/broadcaster)";
-                }
-                break;
-            case "tr":
-                switch (key)
-                {
-                    case "heistMsgUpdateAvailable":
-                        return "🔔 Bankheist güncellemesi mevcut! Mevcut: v%currentVersion% → Yeni: v%latestVersion% | %url%";
-                    case "heistMsgUpdateUpToDate":
-                        return "✅ Bankheist güncel (v%currentVersion%).";
-                    case "heistMsgUpdateCheckFailed":
-                        return "⚠️ Güncelleme kontrolü başarısız (mevcut: v%currentVersion%). Detaylar Streamer.bot günlüğünde.";
-                    case "heistMsgUpdateDenied":
-                        return "❌ %user%, %command% güncelleme kontrolünü çalıştırma iznin yok! (Sadece moderatörler/yayıncı)";
-                }
-                break;
-            case "nl":
-                switch (key)
-                {
-                    case "heistMsgUpdateAvailable":
-                        return "🔔 Bankheist-update beschikbaar! Huidig: v%currentVersion% → Nieuw: v%latestVersion% | %url%";
-                    case "heistMsgUpdateUpToDate":
-                        return "✅ Bankheist is up-to-date (v%currentVersion%).";
-                    case "heistMsgUpdateCheckFailed":
-                        return "⚠️ Updatecontrole mislukt (huidig: v%currentVersion%). Bekijk het Streamer.bot-logboek.";
-                    case "heistMsgUpdateDenied":
-                        return "❌ %user%, je mag de updatecontrole voor %command% niet uitvoeren! (Alleen moderators/broadcaster)";
-                }
-                break;
-            case "pl":
-                switch (key)
-                {
-                    case "heistMsgUpdateAvailable":
-                        return "🔔 Dostępna aktualizacja Bankheist! Obecna: v%currentVersion% → Nowa: v%latestVersion% | %url%";
-                    case "heistMsgUpdateUpToDate":
-                        return "✅ Bankheist jest aktualny (v%currentVersion%).";
-                    case "heistMsgUpdateCheckFailed":
-                        return "⚠️ Sprawdzanie aktualizacji nie powiodło się (obecna: v%currentVersion%). Sprawdź log Streamer.bot.";
-                    case "heistMsgUpdateDenied":
-                        return "❌ %user%, nie masz uprawnień do sprawdzenia aktualizacji %command%! (Tylko moderatorzy/broadcaster)";
-                }
-                break;
-            default:
-                switch (key)
-                {
-                    case "heistMsgUpdateAvailable":
-                        return "🔔 Bankheist update available! Current: v%currentVersion% → Latest: v%latestVersion% | %url%";
-                    case "heistMsgUpdateUpToDate":
-                        return "✅ Bankheist is up to date (v%currentVersion%).";
-                    case "heistMsgUpdateCheckFailed":
-                        return "⚠️ Update check failed (current: v%currentVersion%). Check the Streamer.bot log for details.";
-                    case "heistMsgUpdateDenied":
-                        return "❌ %user%, you are not allowed to run the update check for %command%! (Moderators/Broadcaster only)";
-                }
-                break;
-        }
-
-        return "";
-    }
 
     private string GetBuiltInDe(string key)
     {
@@ -1733,6 +1836,22 @@ public class CPHInline
                 return "❌ Das Punktesystem ist gerade nicht erreichbar oder nicht korrekt eingerichtet. Bitte später erneut versuchen.";
             case "heistMsgStatusNotJoined":
                 return "Nicht dabei";
+            case "heistMsgUpdateAvailable":
+                return "🔔 Bankheist-Update verfügbar! Aktuell: v%currentVersion% → Neu: v%latestVersion% | %url%";
+            case "heistMsgUpdateUpToDate":
+                return "✅ Bankheist ist auf dem neuesten Stand (v%currentVersion%).";
+            case "heistMsgUpdateCheckFailed":
+                return "⚠️ Update-Prüfung fehlgeschlagen (aktuell: v%currentVersion%). Details im Streamer.bot-Log.";
+            case "heistMsgUpdateDenied":
+                return "❌ %user%, du hast keine Berechtigung, den Update-Check für %command% auszuführen! (Nur Moderatoren/Broadcaster)";
+            case "heistMsgUpdateDownloadSuccess":
+                return "📦 Update v%latestVersion% gespeichert (%filePath%) & in die Zwischenablage kopiert! In Streamer.bot: Import → Strg+V → Import.";
+            case "heistMsgUpdateDownloadFileOnly":
+                return "📦 Update v%latestVersion% gespeichert unter: %filePath% (Inhalt kopieren → Streamer.bot → Import).";
+            case "heistMsgUpdateDownloadFailed":
+                return "❌ Download von Update v%latestVersion% fehlgeschlagen. Details im Streamer.bot-Log.";
+            case "heistMsgUpdateDownloadDenied":
+                return "❌ %user%, nur der Broadcaster darf %command% getupdate ausführen!";
             case "heistWordPoints":
                 return "Punkte";
             default:
@@ -1788,6 +1907,22 @@ public class CPHInline
                 return "❌ The points service is not available or is not configured correctly. Please try again later.";
             case "heistMsgStatusNotJoined":
                 return "Not joined";
+            case "heistMsgUpdateAvailable":
+                return "🔔 Bankheist update available! Current: v%currentVersion% → Latest: v%latestVersion% | %url%";
+            case "heistMsgUpdateUpToDate":
+                return "✅ Bankheist is up to date (v%currentVersion%).";
+            case "heistMsgUpdateCheckFailed":
+                return "⚠️ Update check failed (current: v%currentVersion%). Check the Streamer.bot log for details.";
+            case "heistMsgUpdateDenied":
+                return "❌ %user%, you are not allowed to run the update check for %command%! (Moderators/Broadcaster only)";
+            case "heistMsgUpdateDownloadSuccess":
+                return "📦 Update v%latestVersion% saved (%filePath%) & copied to clipboard! In Streamer.bot: Import → Ctrl+V → Import.";
+            case "heistMsgUpdateDownloadFileOnly":
+                return "📦 Update v%latestVersion% saved to: %filePath% (copy contents → Streamer.bot → Import).";
+            case "heistMsgUpdateDownloadFailed":
+                return "❌ Failed to download update v%latestVersion%. Check the Streamer.bot log for details.";
+            case "heistMsgUpdateDownloadDenied":
+                return "❌ %user%, only the broadcaster is allowed to run %command% getupdate!";
             case "heistWordPoints":
                 return "points";
             default:
@@ -1843,6 +1978,22 @@ public class CPHInline
                 return "❌ El servicio de puntos no está disponible o no está configurado correctamente. Inténtalo más tarde.";
             case "heistMsgStatusNotJoined":
                 return "No unido";
+            case "heistMsgUpdateAvailable":
+                return "🔔 ¡Actualización de Bankheist disponible! Actual: v%currentVersion% → Nueva: v%latestVersion% | %url%";
+            case "heistMsgUpdateUpToDate":
+                return "✅ Bankheist está actualizado (v%currentVersion%).";
+            case "heistMsgUpdateCheckFailed":
+                return "⚠️ Error al comprobar actualizaciones (actual: v%currentVersion%). Revisa el registro de Streamer.bot.";
+            case "heistMsgUpdateDenied":
+                return "❌ %user%, no tienes permiso para comprobar actualizaciones de %command%. (Solo moderadores/broadcaster)";
+            case "heistMsgUpdateDownloadSuccess":
+                return "📦 Actualización v%latestVersion% guardada (%filePath%) y copiada al portapapeles. En Streamer.bot: Import → Ctrl+V → Import.";
+            case "heistMsgUpdateDownloadFileOnly":
+                return "📦 Actualización v%latestVersion% guardada en: %filePath% (copia el contenido → Streamer.bot → Import).";
+            case "heistMsgUpdateDownloadFailed":
+                return "❌ Error al descargar la actualización v%latestVersion%. Revisa el registro de Streamer.bot.";
+            case "heistMsgUpdateDownloadDenied":
+                return "❌ %user%, solo el broadcaster puede ejecutar %command% getupdate.";
             case "heistWordPoints":
                 return "puntos";
             default:
@@ -1898,6 +2049,22 @@ public class CPHInline
                 return "❌ Le service de points n'est pas disponible ou n'est pas configuré correctement. Réessaie plus tard.";
             case "heistMsgStatusNotJoined":
                 return "Pas inscrit";
+            case "heistMsgUpdateAvailable":
+                return "🔔 Mise à jour Bankheist disponible ! Actuelle : v%currentVersion% → Nouvelle : v%latestVersion% | %url%";
+            case "heistMsgUpdateUpToDate":
+                return "✅ Bankheist est à jour (v%currentVersion%).";
+            case "heistMsgUpdateCheckFailed":
+                return "⚠️ Échec de la vérification de mise à jour (actuelle : v%currentVersion%). Voir les logs Streamer.bot.";
+            case "heistMsgUpdateDenied":
+                return "❌ %user%, tu n'as pas l'autorisation de vérifier les mises à jour pour %command% ! (Modérateurs/Broadcaster uniquement)";
+            case "heistMsgUpdateDownloadSuccess":
+                return "📦 Mise à jour v%latestVersion% enregistrée (%filePath%) et copiée dans le presse-papiers ! Dans Streamer.bot : Import → Ctrl+V → Import.";
+            case "heistMsgUpdateDownloadFileOnly":
+                return "📦 Mise à jour v%latestVersion% enregistrée dans : %filePath% (copie le contenu → Streamer.bot → Import).";
+            case "heistMsgUpdateDownloadFailed":
+                return "❌ Échec du téléchargement de la mise à jour v%latestVersion%. Voir les logs Streamer.bot.";
+            case "heistMsgUpdateDownloadDenied":
+                return "❌ %user%, seul le broadcaster peut exécuter %command% getupdate !";
             case "heistWordPoints":
                 return "points";
             default:
@@ -1953,6 +2120,22 @@ public class CPHInline
                 return "❌ O serviço de pontos não está disponível ou não foi configurado corretamente. Tente novamente mais tarde.";
             case "heistMsgStatusNotJoined":
                 return "Não entrou";
+            case "heistMsgUpdateAvailable":
+                return "🔔 Atualização do Bankheist disponível! Atual: v%currentVersion% → Nova: v%latestVersion% | %url%";
+            case "heistMsgUpdateUpToDate":
+                return "✅ O Bankheist está atualizado (v%currentVersion%).";
+            case "heistMsgUpdateCheckFailed":
+                return "⚠️ Falha ao verificar atualizações (atual: v%currentVersion%). Veja o log do Streamer.bot.";
+            case "heistMsgUpdateDenied":
+                return "❌ %user%, você não tem permissão para verificar atualizações de %command%! (Somente moderadores/broadcaster)";
+            case "heistMsgUpdateDownloadSuccess":
+                return "📦 Atualização v%latestVersion% salva (%filePath%) e copiada para a área de transferência! No Streamer.bot: Import → Ctrl+V → Import.";
+            case "heistMsgUpdateDownloadFileOnly":
+                return "📦 Atualização v%latestVersion% salva em: %filePath% (copie o conteúdo → Streamer.bot → Import).";
+            case "heistMsgUpdateDownloadFailed":
+                return "❌ Falha ao baixar a atualização v%latestVersion%. Veja o log do Streamer.bot.";
+            case "heistMsgUpdateDownloadDenied":
+                return "❌ %user%, somente o broadcaster pode executar %command% getupdate!";
             case "heistWordPoints":
                 return "pontos";
             default:
@@ -2008,6 +2191,22 @@ public class CPHInline
                 return "❌ Puan servisi şu anda kullanılamıyor veya doğru yapılandırılmamış. Lütfen daha sonra tekrar dene.";
             case "heistMsgStatusNotJoined":
                 return "Katılmadı";
+            case "heistMsgUpdateAvailable":
+                return "🔔 Bankheist güncellemesi mevcut! Mevcut: v%currentVersion% → Yeni: v%latestVersion% | %url%";
+            case "heistMsgUpdateUpToDate":
+                return "✅ Bankheist güncel (v%currentVersion%).";
+            case "heistMsgUpdateCheckFailed":
+                return "⚠️ Güncelleme kontrolü başarısız (mevcut: v%currentVersion%). Detaylar Streamer.bot günlüğünde.";
+            case "heistMsgUpdateDenied":
+                return "❌ %user%, %command% güncelleme kontrolünü çalıştırma iznin yok! (Sadece moderatörler/yayıncı)";
+            case "heistMsgUpdateDownloadSuccess":
+                return "📦 v%latestVersion% güncellemesi kaydedildi (%filePath%) ve panoya kopyalandı! Streamer.bot: Import → Ctrl+V → Import.";
+            case "heistMsgUpdateDownloadFileOnly":
+                return "📦 v%latestVersion% güncellemesi kaydedildi: %filePath% (içeriği kopyala → Streamer.bot → Import).";
+            case "heistMsgUpdateDownloadFailed":
+                return "❌ v%latestVersion% güncellemesi indirilemedi. Detaylar Streamer.bot günlüğünde.";
+            case "heistMsgUpdateDownloadDenied":
+                return "❌ %user%, %command% getupdate komutunu sadece yayıncı çalıştırabilir!";
             case "heistWordPoints":
                 return "puan";
             default:
@@ -2063,6 +2262,22 @@ public class CPHInline
                 return "❌ De puntenservice is niet beschikbaar of niet goed ingesteld. Probeer het later opnieuw.";
             case "heistMsgStatusNotJoined":
                 return "Niet meegedaan";
+            case "heistMsgUpdateAvailable":
+                return "🔔 Bankheist-update beschikbaar! Huidig: v%currentVersion% → Nieuw: v%latestVersion% | %url%";
+            case "heistMsgUpdateUpToDate":
+                return "✅ Bankheist is up-to-date (v%currentVersion%).";
+            case "heistMsgUpdateCheckFailed":
+                return "⚠️ Updatecontrole mislukt (huidig: v%currentVersion%). Bekijk het Streamer.bot-logboek.";
+            case "heistMsgUpdateDenied":
+                return "❌ %user%, je mag de updatecontrole voor %command% niet uitvoeren! (Alleen moderators/broadcaster)";
+            case "heistMsgUpdateDownloadSuccess":
+                return "📦 Update v%latestVersion% opgeslagen (%filePath%) en naar het klembord gekopieerd! In Streamer.bot: Import → Ctrl+V → Import.";
+            case "heistMsgUpdateDownloadFileOnly":
+                return "📦 Update v%latestVersion% opgeslagen in: %filePath% (kopieer de inhoud → Streamer.bot → Import).";
+            case "heistMsgUpdateDownloadFailed":
+                return "❌ Downloaden van update v%latestVersion% mislukt. Bekijk het Streamer.bot-logboek.";
+            case "heistMsgUpdateDownloadDenied":
+                return "❌ %user%, alleen de broadcaster mag %command% getupdate uitvoeren!";
             case "heistWordPoints":
                 return "punten";
             default:
@@ -2118,6 +2333,22 @@ public class CPHInline
                 return "❌ Usługa punktów jest niedostępna albo nie jest poprawnie skonfigurowana. Spróbuj ponownie później.";
             case "heistMsgStatusNotJoined":
                 return "Nie dołączono";
+            case "heistMsgUpdateAvailable":
+                return "🔔 Dostępna aktualizacja Bankheist! Obecna: v%currentVersion% → Nowa: v%latestVersion% | %url%";
+            case "heistMsgUpdateUpToDate":
+                return "✅ Bankheist jest aktualny (v%currentVersion%).";
+            case "heistMsgUpdateCheckFailed":
+                return "⚠️ Sprawdzanie aktualizacji nie powiodło się (obecna: v%currentVersion%). Sprawdź log Streamer.bot.";
+            case "heistMsgUpdateDenied":
+                return "❌ %user%, nie masz uprawnień do sprawdzenia aktualizacji %command%! (Tylko moderatorzy/broadcaster)";
+            case "heistMsgUpdateDownloadSuccess":
+                return "📦 Aktualizacja v%latestVersion% zapisana (%filePath%) i skopiowana do schowka! W Streamer.bot: Import → Ctrl+V → Import.";
+            case "heistMsgUpdateDownloadFileOnly":
+                return "📦 Aktualizacja v%latestVersion% zapisana w: %filePath% (skopiuj zawartość → Streamer.bot → Import).";
+            case "heistMsgUpdateDownloadFailed":
+                return "❌ Pobieranie aktualizacji v%latestVersion% nie powiodło się. Sprawdź log Streamer.bot.";
+            case "heistMsgUpdateDownloadDenied":
+                return "❌ %user%, tylko broadcaster może uruchomić %command% getupdate!";
             case "heistWordPoints":
                 return "punkty";
             default:
