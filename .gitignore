@@ -53,3 +53,9 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Streamer.bot local update tokens & downloads
+github_token.txt
+*_Updates/github_token.txt
+Bankheist_Updates/
+

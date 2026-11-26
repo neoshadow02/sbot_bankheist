@@ -3,8 +3,10 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.IO.Compression;
 using System.Net;
 using System.Text;
+using System.Text.RegularExpressions;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
@@ -13,14 +15,25 @@ public class CPHInline
     // =========================================================================
     // CONSTANTS & MODELS
     // =========================================================================
-    private const string ScriptVersion = "2.3.0";
-    private const string GitHubLatestReleaseUrl = "https://api.github.com/repos/neoshadow02/sbot_bankheist/releases/latest";
-    private const string GitHubReleasesFallbackUrl = "https://github.com/neoshadow02/sbot_bankheist/releases/latest";
-    private const string GitHubRawImportUrlTemplate = "https://raw.githubusercontent.com/neoshadow02/sbot_bankheist/{0}/import.sb";
+    private const string ScriptVersion = "2.4.0";
+    private const string GitHubRepoOwner = "neoshadow02";
+    private const string GitHubRepoName = "sbot_bankheist";
+    private const string GitHubLatestReleaseUrl = "https://api.github.com/repos/" + GitHubRepoOwner + "/" + GitHubRepoName + "/releases/latest";
+    private const string GitHubReleasesFallbackUrl = "https://github.com/" + GitHubRepoOwner + "/" + GitHubRepoName + "/releases/latest";
+    private const string GitHubReleaseUrlPrefix = "https://github.com/" + GitHubRepoOwner + "/" + GitHubRepoName + "/";
+    private const string GitHubRawFileUrlTemplate = "https://raw.githubusercontent.com/" + GitHubRepoOwner + "/" + GitHubRepoName + "/{0}/{1}";
     private const string UpdateDownloadFolderName = "Bankheist_Updates";
+    private const string GitHubTokenFileName = "github_token.txt";
+    private const string GitHubTokenEnvVar = "SBOT_BANKHEIST_GITHUB_TOKEN";
+
     private const int UpdateCheckIntervalHours = 24;
+    private const int ManualUpdateCooldownSeconds = 15;
     private const int UpdateCheckTimeoutMs = 3000;
     private const int UpdateDownloadTimeoutMs = 10000;
+    private const int MaxChatMessageLength = 490;
+    private const int MaxReleaseJsonBytes = 512 * 1024;             // 512 KB
+    private const int MaxImportDownloadBytes = 2 * 1024 * 1024;     // 2 MB
+    private const int MaxImportDecompressedBytes = 4 * 1024 * 1024; // 4 MB (zip-bomb protection)
 
     private const string DefaultCommand = "!heist";
     private const string DefaultJoinTimerName = "[MINIGAME] Bankheist Multilingual - Timer - Join";
@@ -36,14 +49,28 @@ public class CPHInline
     private const string VarLatestVersion = "heist_latest_version";
     private const string VarUpdateAvailable = "heist_update_available";
     private const string VarLastUpdateCheckIso = "heist_last_update_check_iso";
+    private const string VarLastManualUpdateIso = "heist_last_manual_update_iso";
 
     private const string RoleBroadcaster = "broadcaster";
     private const string RoleMod = "mod";
     private const string RoleVip = "vip";
     private const string RoleUser = "user";
 
+    private static readonly object StateLock = new object();
     private static readonly object RngLock = new object();
     private static readonly Random Rng = new Random();
+
+    private static readonly TimeSpan RegexTimeout = TimeSpan.FromMilliseconds(200);
+
+    private static readonly Regex StrictTagNameRegex = new Regex(
+        @"^[vV]?\d+\.\d+(?:\.\d+){0,2}(?:-[0-9A-Za-z.-]+)?$",
+        RegexOptions.Compiled,
+        RegexTimeout);
+
+    private static readonly Regex StrictCleanVersionRegex = new Regex(
+        @"^\d+\.\d+(?:\.\d+){0,2}$",
+        RegexOptions.Compiled,
+        RegexTimeout);
 
     private static readonly string[] MessageKeys = new string[]
     {
@@ -77,6 +104,7 @@ public class CPHInline
             usedCommand = DefaultCommand;
 
         string rawInput = GetArgString("rawInput").ToLowerInvariant();
+        string[] inputTokens = rawInput.Split(new char[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
         string lang = GetLanguage();
 
         // Sync any settings passed via Sub-Action arguments into persistent globals
@@ -91,17 +119,26 @@ public class CPHInline
             return true;
         }
 
-        // Manual update / version check trigger (Broadcaster / Mod / Editor test)
-        if (rawInput == "update" || rawInput == "version")
+        // Manual update / version check & download aliases (e.g. "!heist update", "!heist version", "!heist update get [force] [full]")
+        if (inputTokens.Length > 0 && (inputTokens[0] == "update" || inputTokens[0] == "version"))
         {
+            if (inputTokens.Length >= 2 && (inputTokens[1] == "get" || inputTokens[1] == "getupdate" || inputTokens[1] == "download"))
+            {
+                ParseUpdateDownloadFlags(rawInput, out bool forceAlias, out bool fullAlias);
+                HandleGetUpdateCommand(usedCommand, lang, forceAlias, fullAlias);
+                return true;
+            }
+
             HandleUpdateCommand(usedCommand, lang);
             return true;
         }
 
-        // Download latest import.sb locally + copy to clipboard (Broadcaster / Editor test only)
-        if (rawInput == "getupdate" || rawInput == "getupdate force")
+        // 1-Click Update Download (Broadcaster / Editor test only):
+        //   !heist getupdate [force] [full]
+        if (inputTokens.Length > 0 && inputTokens[0] == "getupdate")
         {
-            HandleGetUpdateCommand(usedCommand, lang, rawInput == "getupdate force");
+            ParseUpdateDownloadFlags(rawInput, out bool forceDownload, out bool fullImport);
+            HandleGetUpdateCommand(usedCommand, lang, forceDownload, fullImport);
             return true;
         }
 
@@ -129,44 +166,41 @@ public class CPHInline
         if (TryGetRemainingCooldown(cooldownSeconds, out int remainingCooldown))
         {
             string msgCooldown = Msg("heistMsgCooldown", lang);
-            CPH.SendMessage(
+            SafeSendMessage(
                 msgCooldown
                     .Replace("%cooldown%", remainingCooldown.ToString(CultureInfo.InvariantCulture))
-                    .Replace("%command%", usedCommand),
-                true);
+                    .Replace("%command%", usedCommand));
             return true;
         }
 
         string currentUserId = GetArgString("userId");
-        string currentUserName = GetArgString("user");
+        string currentUserName = SanitizeUserName(GetArgString("user"));
         if (string.IsNullOrEmpty(currentUserName) && string.IsNullOrEmpty(currentUserId))
             return true;
         if (string.IsNullOrEmpty(currentUserName))
-            currentUserName = currentUserId;
+            currentUserName = SanitizeUserName(currentUserId);
 
         var participants = LoadParticipants();
         string participantKey = BuildParticipantKey(currentUserId, currentUserName);
         if (participants.ContainsKey(participantKey))
         {
             string msgAlreadyIn = Msg("heistMsgAlreadyIn", lang);
-            CPH.SendMessage(
+            SafeSendMessage(
                 msgAlreadyIn
                     .Replace("%user%", currentUserName)
-                    .Replace("%command%", usedCommand),
-                true);
+                    .Replace("%command%", usedCommand));
             return true;
         }
 
-        // Points lookup
+        // Points lookup (HTTP I/O happens outside StateLock)
         long userPoints = GetUserPoints(currentUserId, currentUserName, pointsVariable, defaultPoints);
         if (userPoints < 0)
         {
             string msgPointsApiError = Msg("heistMsgPointsApiError", lang);
-            CPH.SendMessage(
+            SafeSendMessage(
                 msgPointsApiError
                     .Replace("%user%", currentUserName)
-                    .Replace("%command%", usedCommand),
-                true);
+                    .Replace("%command%", usedCommand));
             return true;
         }
 
@@ -178,12 +212,11 @@ public class CPHInline
             if (userPoints < minBet)
             {
                 string msgNotEnoughPoints = Msg("heistMsgNotEnoughPoints", lang);
-                CPH.SendMessage(
+                SafeSendMessage(
                     msgNotEnoughPoints
                         .Replace("%user%", currentUserName)
                         .Replace("%currentPoints%", userPoints.ToString(CultureInfo.InvariantCulture))
-                        .Replace("%command%", usedCommand),
-                    true);
+                        .Replace("%command%", usedCommand));
                 return true;
             }
 
@@ -192,86 +225,89 @@ public class CPHInline
         else if (!long.TryParse(rawInput, NumberStyles.Integer, CultureInfo.InvariantCulture, out betAmount))
         {
             string msgInvalidBet = Msg("heistMsgInvalidBet", lang);
-            CPH.SendMessage(
+            SafeSendMessage(
                 msgInvalidBet
                     .Replace("%min%", minBet.ToString(CultureInfo.InvariantCulture))
                     .Replace("%max%", maxBet.ToString(CultureInfo.InvariantCulture))
-                    .Replace("%command%", usedCommand),
-                true);
+                    .Replace("%command%", usedCommand));
             return true;
         }
 
         if (betAmount < minBet || betAmount > maxBet)
         {
             string msgInvalidBet = Msg("heistMsgInvalidBet", lang);
-            CPH.SendMessage(
+            SafeSendMessage(
                 msgInvalidBet
                     .Replace("%min%", minBet.ToString(CultureInfo.InvariantCulture))
                     .Replace("%max%", maxBet.ToString(CultureInfo.InvariantCulture))
-                    .Replace("%command%", usedCommand),
-                true);
+                    .Replace("%command%", usedCommand));
             return true;
         }
 
         if (userPoints < betAmount)
         {
             string msgNotEnoughPoints = Msg("heistMsgNotEnoughPoints", lang);
-            CPH.SendMessage(
+            SafeSendMessage(
                 msgNotEnoughPoints
                     .Replace("%user%", currentUserName)
                     .Replace("%currentPoints%", userPoints.ToString(CultureInfo.InvariantCulture))
-                    .Replace("%command%", usedCommand),
-                true);
+                    .Replace("%command%", usedCommand));
             return true;
         }
 
-        // Deduct bet through the selected points system
+        // Deduct bet through the selected points system (HTTP I/O outside StateLock)
         if (!TryDeductUserPoints(currentUserId, currentUserName, pointsVariable, userPoints, betAmount))
         {
             string msgPointsApiError = Msg("heistMsgPointsApiError", lang);
-            CPH.SendMessage(
+            SafeSendMessage(
                 msgPointsApiError
                     .Replace("%user%", currentUserName)
-                    .Replace("%command%", usedCommand),
-                true);
+                    .Replace("%command%", usedCommand));
             return true;
         }
 
-        participants[participantKey] = new HeistParticipant
+        bool startedNewLobby = false;
+        lock (StateLock)
         {
-            UserId = currentUserId,
-            UserName = currentUserName,
-            Bet = betAmount,
-            Role = GetCurrentUserRole()
-        };
-        SaveParticipants(participants);
+            participants = LoadParticipants();
+            participants[participantKey] = new HeistParticipant
+            {
+                UserId = currentUserId,
+                UserName = currentUserName,
+                Bet = betAmount,
+                Role = GetCurrentUserRole()
+            };
+            SaveParticipants(participants);
 
-        bool isLobbyActive = CPH.GetGlobalVar<bool>(VarHeistActive, false);
-        if (!isLobbyActive)
+            bool isLobbyActive = CPH.GetGlobalVar<bool>(VarHeistActive, false);
+            if (!isLobbyActive)
+            {
+                CPH.SetGlobalVar(VarHeistActive, true, false);
+                CPH.SetGlobalVar(VarStartTimeIso, GetUtcNow().ToString("o", CultureInfo.InvariantCulture), false);
+                CPH.SetGlobalVar(VarUsedCommand, usedCommand, false);
+                startedNewLobby = true;
+            }
+        }
+
+        if (startedNewLobby)
         {
-            CPH.SetGlobalVar(VarHeistActive, true, false);
-            CPH.SetGlobalVar(VarStartTimeIso, DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture), false);
-            CPH.SetGlobalVar(VarUsedCommand, usedCommand, false);
-
             string msgStart = Msg("heistMsgStart", lang);
-            CPH.SendMessage(
+            SafeSendMessage(
                 msgStart
                     .Replace("%user%", currentUserName)
                     .Replace("%remainingTime%", joinTimeSeconds.ToString(CultureInfo.InvariantCulture))
-                    .Replace("%command%", usedCommand),
-                true);
+                    .Replace("%command%", usedCommand));
 
             StartTimer(joinTimerId, DefaultJoinTimerName, joinTimeSeconds);
         }
         else
         {
             string msgJoined = Msg("heistMsgJoined", lang);
-            CPH.SendMessage(
+            SafeSendMessage(
                 msgJoined
                     .Replace("%user%", currentUserName)
                     .Replace("%amount%", betAmount.ToString(CultureInfo.InvariantCulture))
-                    .Replace("%command%", usedCommand),
-                true);
+                    .Replace("%command%", usedCommand));
         }
 
         return true;
@@ -282,7 +318,7 @@ public class CPHInline
     // =========================================================================
     public bool ExecuteHeist()
     {
-        string lang = GetLanguage();
+        string lang = GetStoredLanguageFast();
         string joinTimerId = GetConfigString("heistJoinTimerId", "").Trim();
         StopTimer(joinTimerId, DefaultJoinTimerName);
 
@@ -312,14 +348,18 @@ public class CPHInline
         string msgPartial = Msg("heistMsgPartial", lang);
         string msgFailed = Msg("heistMsgFailed", lang);
 
-        var participants = LoadParticipants();
+        Dictionary<string, HeistParticipant> participants;
+        lock (StateLock)
+        {
+            participants = LoadParticipants();
+        }
+
         if (participants.Count < minParticipants)
         {
-            CPH.SendMessage(
+            SafeSendMessage(
                 msgNotEnoughPlayers
                     .Replace("%minPlayers%", minParticipants.ToString(CultureInfo.InvariantCulture))
-                    .Replace("%command%", usedCommand),
-                true);
+                    .Replace("%command%", usedCommand));
 
             bool refundError = false;
             foreach (var participant in participants.Values)
@@ -327,19 +367,19 @@ public class CPHInline
                 if (participant == null || participant.Bet <= 0)
                     continue;
 
-                DebugLog($"Cancelled. Refunding {participant.Bet} points to {participant.UserName}...");
+                DebugLog($"Cancelled. Refunding {participant.Bet} points to {SanitizeLogText(participant.UserName)}...");
                 if (!AddUserPoints(participant.UserId, participant.UserName, pointsVariable, participant.Bet))
                     refundError = true;
             }
 
             if (refundError)
-                CPH.SendMessage(msgPointsApiError.Replace("%command%", usedCommand), true);
+                SafeSendMessage(msgPointsApiError.Replace("%command%", usedCommand));
 
             ClearLobbyState();
             return true;
         }
 
-        CPH.SendMessage(msgProgress.Replace("%command%", usedCommand), true);
+        SafeSendMessage(msgProgress.Replace("%command%", usedCommand));
 
         var survivors = new List<string>();
         var caught = new List<string>();
@@ -358,25 +398,26 @@ public class CPHInline
                 chanceVip,
                 chanceUser);
 
+            string safeUser = SanitizeUserName(participant.UserName);
             int roll = NextRandomPercent();
             if (roll <= survivalChance)
             {
                 long winAmount = CalculatePayout(participant.Bet, winMultiplier);
-                DebugLog($"{participant.UserName} ({participant.Role}, {survivalChance}%) WON! Roll: {roll} | Bet: {participant.Bet} | Multiplier: {winMultiplier} | Payout: {winAmount}");
+                DebugLog($"{SanitizeLogText(safeUser)} ({participant.Role}, {survivalChance}%) WON! Roll: {roll} | Bet: {participant.Bet} | Multiplier: {winMultiplier} | Payout: {winAmount}");
 
                 if (!AddUserPoints(participant.UserId, participant.UserName, pointsVariable, winAmount))
                 {
-                    CPH.LogError($"[Bankheist] Failed to add {winAmount} points to {participant.UserName}.");
+                    CPH.LogError($"[Bankheist] Failed to add {winAmount} points to {SanitizeLogText(safeUser)}.");
                     payoutError = true;
                 }
 
-                survivors.Add(participant.UserName);
+                survivors.Add(safeUser);
                 totalPayout = SafeAdd(totalPayout, winAmount);
             }
             else
             {
-                DebugLog($"{participant.UserName} ({participant.Role}, {survivalChance}%) lost (caught). Roll: {roll} | Bet: {participant.Bet}.");
-                caught.Add(participant.UserName);
+                DebugLog($"{SanitizeLogText(safeUser)} ({participant.Role}, {survivalChance}%) lost (caught). Roll: {roll} | Bet: {participant.Bet}.");
+                caught.Add(safeUser);
             }
         }
 
@@ -397,16 +438,19 @@ public class CPHInline
             .Replace("%payout%", totalPayout.ToString(CultureInfo.InvariantCulture))
             .Replace("%command%", usedCommand);
 
-        CPH.SendMessage(finalMsg, true);
+        SafeSendMessage(finalMsg);
         if (payoutError)
-            CPH.SendMessage(msgPointsApiError.Replace("%command%", usedCommand), true);
+            SafeSendMessage(msgPointsApiError.Replace("%command%", usedCommand));
 
         ClearLobbyState();
 
         if (cooldownSeconds > 0)
         {
-            CPH.SetGlobalVar(VarCooldownActive, true, false);
-            CPH.SetGlobalVar(VarLastRunIso, DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture), true);
+            lock (StateLock)
+            {
+                CPH.SetGlobalVar(VarCooldownActive, true, false);
+                CPH.SetGlobalVar(VarLastRunIso, GetUtcNow().ToString("o", CultureInfo.InvariantCulture), true);
+            }
             StartTimer(cooldownTimerId, DefaultCooldownTimerName, cooldownSeconds);
         }
         else
@@ -427,13 +471,16 @@ public class CPHInline
 
     private bool ResetCooldownInternal(bool announce)
     {
-        CPH.SetGlobalVar(VarCooldownActive, false, false);
+        lock (StateLock)
+        {
+            CPH.SetGlobalVar(VarCooldownActive, false, false);
+        }
         string cooldownTimerId = GetConfigString("heistCooldownTimerId", "").Trim();
         StopTimer(cooldownTimerId, DefaultCooldownTimerName);
 
         if (announce)
         {
-            string lang = GetLanguage();
+            string lang = GetStoredLanguageFast();
             string usedCommand = CPH.GetGlobalVar<string>(VarUsedCommand, false);
             if (string.IsNullOrEmpty(usedCommand))
                 usedCommand = DefaultCommand;
@@ -443,12 +490,11 @@ public class CPHInline
             string msgReminder = Msg("heistMsgReminder", lang);
             if (!string.IsNullOrEmpty(msgReminder))
             {
-                CPH.SendMessage(
+                SafeSendMessage(
                     msgReminder
                         .Replace("%command%", usedCommand)
                         .Replace("%min%", minBet.ToString(CultureInfo.InvariantCulture))
-                        .Replace("%max%", maxBet.ToString(CultureInfo.InvariantCulture)),
-                    true);
+                        .Replace("%max%", maxBet.ToString(CultureInfo.InvariantCulture)));
             }
         }
 
@@ -456,24 +502,91 @@ public class CPHInline
     }
 
     // =========================================================================
-    // ENTRY POINT 4: METHOD EXECUTE - Streamer.bot Started / manual update check
+    // ENTRY POINT 4: METHOD EXECUTE - Streamer.bot Started (optional)
     // =========================================================================
     public bool CheckForUpdate()
     {
-        if (!IsConfigBoolTrue("heistCheckForUpdates", true))
-            return true;
+        try
+        {
+            string lang = GetLanguage();
+            SyncSettingsFromArgs(lang);
+            if (!IsConfigBoolTrue("heistCheckForUpdates", true))
+                return true;
 
-        string lang = GetLanguage();
-        string usedCommand = CPH.GetGlobalVar<string>(VarUsedCommand, false);
-        if (string.IsNullOrEmpty(usedCommand))
-            usedCommand = DefaultCommand;
+            string usedCommand = CPH.GetGlobalVar<string>(VarUsedCommand, false);
+            if (string.IsNullOrEmpty(usedCommand))
+                usedCommand = DefaultCommand;
 
-        RunUpdateCheck(usedCommand, lang, isManualCommand: false);
+            RunUpdateCheck(usedCommand, lang, isManualCommand: false);
+        }
+        catch (Exception ex)
+        {
+            CPH.LogError($"[Bankheist] Error in CheckForUpdate: {SanitizeLogText(ex.Message)}");
+        }
         return true;
     }
 
     // =========================================================================
-    // COMMAND HANDLERS & STATE HELPERS
+    // ENTRY POINT 5: METHOD EXECUTE - Manual Update Check (optional standalone)
+    // =========================================================================
+    public bool CheckUpdateManual()
+    {
+        try
+        {
+            string usedCommand = GetArgString("command");
+            if (string.IsNullOrEmpty(usedCommand))
+                usedCommand = CPH.GetGlobalVar<string>(VarUsedCommand, false);
+            if (string.IsNullOrEmpty(usedCommand))
+                usedCommand = DefaultCommand;
+
+            string lang = GetLanguage();
+            SyncSettingsFromArgs(lang);
+
+            string rawInput = GetArgString("rawInput").ToLowerInvariant();
+            string[] tokens = rawInput.Split(new char[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            if (tokens.Length > 0 && (tokens[0] == "get" || tokens[0] == "getupdate" || tokens[0] == "download"))
+            {
+                ParseUpdateDownloadFlags(rawInput, out bool forceDownload, out bool fullImport);
+                HandleGetUpdateCommand(usedCommand, lang, forceDownload, fullImport);
+                return true;
+            }
+
+            HandleUpdateCommand(usedCommand, lang);
+        }
+        catch (Exception ex)
+        {
+            CPH.LogError($"[Bankheist] Error in CheckUpdateManual: {SanitizeLogText(ex.Message)}");
+        }
+        return true;
+    }
+
+    // =========================================================================
+    // ENTRY POINT 6: METHOD EXECUTE - 1-Click Update Download (optional standalone)
+    // =========================================================================
+    public bool DownloadUpdate()
+    {
+        try
+        {
+            string usedCommand = GetArgString("command");
+            if (string.IsNullOrEmpty(usedCommand))
+                usedCommand = CPH.GetGlobalVar<string>(VarUsedCommand, false);
+            if (string.IsNullOrEmpty(usedCommand))
+                usedCommand = DefaultCommand;
+
+            string lang = GetLanguage();
+            SyncSettingsFromArgs(lang);
+            ParseUpdateDownloadFlags(GetArgString("rawInput"), out bool forceDownload, out bool fullImport);
+            HandleGetUpdateCommand(usedCommand, lang, forceDownload, fullImport);
+        }
+        catch (Exception ex)
+        {
+            CPH.LogError($"[Bankheist] Error in DownloadUpdate: {SanitizeLogText(ex.Message)}");
+        }
+        return true;
+    }
+
+    // =========================================================================
+    // COMMAND HANDLERS & UPDATE SYSTEM
     // =========================================================================
     private bool HasAdminPermission(out string userName)
     {
@@ -490,11 +603,10 @@ public class CPHInline
         if (!HasAdminPermission(out string userName))
         {
             string msgSetupDenied = Msg("heistMsgSetupDenied", lang);
-            CPH.SendMessage(
+            SafeSendMessage(
                 msgSetupDenied
-                    .Replace("%user%", userName)
-                    .Replace("%command%", usedCommand),
-                true);
+                    .Replace("%user%", SanitizeUserName(userName))
+                    .Replace("%command%", usedCommand));
             return;
         }
 
@@ -515,27 +627,50 @@ public class CPHInline
         if (!HasAdminPermission(out string userName))
         {
             string msgDenied = Msg("heistMsgUpdateDenied", lang);
-            CPH.SendMessage(
+            SafeSendMessage(
                 msgDenied
-                    .Replace("%user%", userName)
-                    .Replace("%command%", usedCommand),
-                true);
+                    .Replace("%user%", SanitizeUserName(userName))
+                    .Replace("%command%", usedCommand));
             return;
         }
 
+        if (IsManualUpdateRateLimited())
+        {
+            CPH.LogInfo("[Bankheist] Manual update check throttled (cooldown active).");
+            return;
+        }
+
+        CPH.SetGlobalVar(VarLastManualUpdateIso, GetUtcNow().ToString("o", CultureInfo.InvariantCulture), true);
         RunUpdateCheck(usedCommand, lang, isManualCommand: true);
     }
 
-    private void HandleGetUpdateCommand(string usedCommand, string lang, bool forceDownload)
+    private void ParseUpdateDownloadFlags(string rawInput, out bool forceDownload, out bool fullImport)
+    {
+        forceDownload = false;
+        fullImport = false;
+        if (string.IsNullOrWhiteSpace(rawInput))
+            return;
+
+        string[] parts = rawInput.ToLowerInvariant().Split(new char[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+        for (int i = 0; i < parts.Length; i++)
+        {
+            string p = parts[i];
+            if (p == "force")
+                forceDownload = true;
+            else if (p == "full" || p == "all" || p == "init" || p == "initial")
+                fullImport = true;
+        }
+    }
+
+    private void HandleGetUpdateCommand(string usedCommand, string lang, bool forceDownload, bool fullImport = false)
     {
         if (!HasBroadcasterPermission(out string userName))
         {
             string msgDenied = Msg("heistMsgUpdateDownloadDenied", lang);
-            CPH.SendMessage(
+            SafeSendMessage(
                 msgDenied
-                    .Replace("%user%", userName)
-                    .Replace("%command%", usedCommand),
-                true);
+                    .Replace("%user%", SanitizeUserName(userName))
+                    .Replace("%command%", usedCommand));
             return;
         }
 
@@ -545,7 +680,7 @@ public class CPHInline
             string json = FetchLatestReleaseJson(GitHubLatestReleaseUrl, UpdateCheckTimeoutMs);
             if (string.IsNullOrEmpty(json))
             {
-                CPH.LogWarn($"[Bankheist] Update download aborted: could not query GitHub latest release.");
+                CPH.LogWarn("[Bankheist] Update download aborted: could not query GitHub latest release.");
                 string msgCheckFailed = Msg("heistMsgUpdateCheckFailed", lang);
                 SafeSendMessage(
                     msgCheckFailed
@@ -556,14 +691,12 @@ public class CPHInline
 
             JObject obj = JObject.Parse(json);
             string tagName = obj["tag_name"] != null ? obj["tag_name"].ToString().Trim() : "";
-            string releaseUrl = obj["html_url"] != null ? obj["html_url"].ToString().Trim() : GitHubReleasesFallbackUrl;
-            if (string.IsNullOrEmpty(releaseUrl))
-                releaseUrl = GitHubReleasesFallbackUrl;
+            string releaseUrl = ValidateReleaseUrl(obj["html_url"] != null ? obj["html_url"].ToString().Trim() : "");
 
             cleanLatest = NormalizeVersionString(tagName);
-            if (string.IsNullOrEmpty(tagName) || string.IsNullOrEmpty(cleanLatest))
+            if (!IsSafeTagName(tagName) || !IsSafeCleanVersion(cleanLatest))
             {
-                CPH.LogWarn("[Bankheist] Update download aborted: invalid tag_name from GitHub.");
+                CPH.LogWarn($"[Bankheist] Update download aborted: invalid tag_name '{SanitizeLogText(tagName)}'.");
                 string msgFailed = Msg("heistMsgUpdateDownloadFailed", lang);
                 SafeSendMessage(
                     msgFailed
@@ -577,7 +710,7 @@ public class CPHInline
             CPH.SetGlobalVar(VarScriptVersion, ScriptVersion, true);
             CPH.SetGlobalVar(VarLatestVersion, cleanLatest, true);
             CPH.SetGlobalVar(VarUpdateAvailable, updateAvailable ? "true" : "false", true);
-            CPH.SetGlobalVar(VarLastUpdateCheckIso, DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture), true);
+            CPH.SetGlobalVar(VarLastUpdateCheckIso, GetUtcNow().ToString("o", CultureInfo.InvariantCulture), true);
 
             if (!updateAvailable && !forceDownload)
             {
@@ -591,11 +724,23 @@ public class CPHInline
                 return;
             }
 
-            string rawImportUrl = string.Format(CultureInfo.InvariantCulture, GitHubRawImportUrlTemplate, Uri.EscapeDataString(tagName));
-            string importContent = DownloadImportString(rawImportUrl, UpdateDownloadTimeoutMs);
+            // Default: download Safe Core-Update (update.sb) that preserves user Settings/Triggers.
+            // Automatic fallback to full import.sb if release has no update.sb, or when 'full' is requested.
+            string targetFileKind = fullImport ? "import" : "update";
+            string rawUrl = string.Format(CultureInfo.InvariantCulture, GitHubRawFileUrlTemplate, Uri.EscapeDataString(tagName), targetFileKind + ".sb");
+            string importContent = DownloadImportString(rawUrl, UpdateDownloadTimeoutMs);
+
+            if (string.IsNullOrEmpty(importContent) && !fullImport)
+            {
+                CPH.LogInfo($"[Bankheist] No update.sb found for {SanitizeLogText(tagName)}, falling back to full import.sb.");
+                targetFileKind = "import";
+                rawUrl = string.Format(CultureInfo.InvariantCulture, GitHubRawFileUrlTemplate, Uri.EscapeDataString(tagName), "import.sb");
+                importContent = DownloadImportString(rawUrl, UpdateDownloadTimeoutMs);
+            }
+
             if (string.IsNullOrEmpty(importContent))
             {
-                CPH.LogError($"[Bankheist] Failed to download import.sb from {rawImportUrl}");
+                CPH.LogError($"[Bankheist] Failed to download {targetFileKind}.sb from {SanitizeLogText(rawUrl)}");
                 string msgFailed = Msg("heistMsgUpdateDownloadFailed", lang);
                 SafeSendMessage(
                     msgFailed
@@ -606,9 +751,9 @@ public class CPHInline
             }
 
             importContent = importContent.Trim();
-            if (!importContent.StartsWith("U0JBRR", StringComparison.Ordinal))
+            if (!ValidateStreamerBotImportPayload(importContent, out string validationError))
             {
-                CPH.LogError("[Bankheist] Downloaded import.sb did not start with valid Streamer.bot SBAE header.");
+                CPH.LogError($"[Bankheist] Downloaded {targetFileKind}.sb failed integrity check: {SanitizeLogText(validationError)}");
                 string msgFailed = Msg("heistMsgUpdateDownloadFailed", lang);
                 SafeSendMessage(
                     msgFailed
@@ -618,15 +763,30 @@ public class CPHInline
                 return;
             }
 
-            string outputDir = GetUpdateOutputDirectory();
+            string outputDir = Path.GetFullPath(GetUpdateOutputDirectory());
             Directory.CreateDirectory(outputDir);
-            string safeVersion = cleanLatest.Replace("..", "").Replace("/", "").Replace("\\", "");
-            string fileName = "import_v" + safeVersion + ".sb";
-            string filePath = Path.Combine(outputDir, fileName);
+            string filePrefix = targetFileKind == "update" ? "update_v" : "import_v";
+            string filePath = Path.GetFullPath(Path.Combine(outputDir, filePrefix + cleanLatest + ".sb"));
+
+            string expectedPrefix = outputDir.EndsWith(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal)
+                ? outputDir
+                : outputDir + Path.DirectorySeparatorChar;
+            if (!filePath.StartsWith(expectedPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                CPH.LogError("[Bankheist] Update download aborted: resolved path escaped output directory.");
+                string msgFailed = Msg("heistMsgUpdateDownloadFailed", lang);
+                SafeSendMessage(
+                    msgFailed
+                        .Replace("%latestVersion%", cleanLatest)
+                        .Replace("%currentVersion%", ScriptVersion)
+                        .Replace("%command%", usedCommand));
+                return;
+            }
+
             File.WriteAllText(filePath, importContent, Encoding.ASCII);
 
             bool copiedToClipboard = TryCopyToClipboard(importContent);
-            CPH.LogInfo($"[Bankheist] Downloaded v{cleanLatest} import.sb to '{filePath}' (clipboard: {copiedToClipboard}).");
+            CPH.LogInfo($"[Bankheist] Downloaded v{cleanLatest} {targetFileKind}.sb to '{SanitizeLogText(filePath)}' (clipboard: {copiedToClipboard}).");
 
             string templateKey = copiedToClipboard ? "heistMsgUpdateDownloadSuccess" : "heistMsgUpdateDownloadFileOnly";
             string msgResult = Msg(templateKey, lang);
@@ -634,100 +794,19 @@ public class CPHInline
                 msgResult
                     .Replace("%latestVersion%", cleanLatest)
                     .Replace("%currentVersion%", ScriptVersion)
-                    .Replace("%filePath%", filePath)
+                    .Replace("%filePath%", FormatChatSafePath(filePath, false))
                     .Replace("%url%", releaseUrl)
                     .Replace("%command%", usedCommand));
         }
         catch (Exception ex)
         {
-            CPH.LogError($"[Bankheist] Update download error: {ex.Message}");
+            CPH.LogError($"[Bankheist] Update download error: {SanitizeLogText(ex.Message)}");
             string msgFailed = Msg("heistMsgUpdateDownloadFailed", lang);
             SafeSendMessage(
                 msgFailed
                     .Replace("%latestVersion%", cleanLatest)
                     .Replace("%currentVersion%", ScriptVersion)
                     .Replace("%command%", usedCommand));
-        }
-    }
-
-    protected virtual string DownloadImportString(string rawUrl, int timeoutMs)
-    {
-        try
-        {
-            try
-            {
-                ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
-            }
-            catch
-            {
-                // Ignore if OS/runtime restricts manual TLS configuration
-            }
-
-            var request = (HttpWebRequest)WebRequest.Create(rawUrl);
-            request.Method = "GET";
-            request.UserAgent = "Streamer.bot-Bankheist/" + ScriptVersion;
-            request.Timeout = timeoutMs;
-            request.ReadWriteTimeout = timeoutMs;
-
-            using (var response = (HttpWebResponse)request.GetResponse())
-            using (var responseStream = response.GetResponseStream())
-            {
-                if (responseStream == null)
-                    return "";
-
-                using (var reader = new StreamReader(responseStream, Encoding.UTF8))
-                {
-                    return reader.ReadToEnd();
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            CPH.LogError($"[Bankheist] DownloadImportString failed for '{rawUrl}': {ex.Message}");
-            return null;
-        }
-    }
-
-    protected virtual string GetUpdateOutputDirectory()
-    {
-        return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, UpdateDownloadFolderName);
-    }
-
-    protected virtual bool TryCopyToClipboard(string text)
-    {
-        if (string.IsNullOrEmpty(text))
-            return false;
-
-        try
-        {
-            var startInfo = new ProcessStartInfo
-            {
-                FileName = "clip.exe",
-                UseShellExecute = false,
-                RedirectStandardInput = true,
-                CreateNoWindow = true
-            };
-
-            using (var process = Process.Start(startInfo))
-            {
-                if (process == null)
-                    return false;
-
-                using (StreamWriter writer = process.StandardInput)
-                {
-                    writer.Write(text);
-                }
-
-                if (!process.WaitForExit(3000))
-                    return false;
-
-                return process.ExitCode == 0;
-            }
-        }
-        catch (Exception ex)
-        {
-            CPH.LogWarn($"[Bankheist] Could not copy import string to clipboard: {ex.Message}");
-            return false;
         }
     }
 
@@ -741,7 +820,7 @@ public class CPHInline
             string rawLastCheck = GetGlobalStringRaw(VarLastUpdateCheckIso);
             if (TryParseIsoUtc(rawLastCheck, out DateTime lastCheckUtc))
             {
-                if ((DateTime.UtcNow - lastCheckUtc).TotalHours < UpdateCheckIntervalHours)
+                if ((GetUtcNow() - lastCheckUtc).TotalHours < UpdateCheckIntervalHours)
                     return;
             }
 
@@ -749,14 +828,14 @@ public class CPHInline
         }
         catch (Exception ex)
         {
-            CPH.LogWarn($"[Bankheist] Scheduled update check skipped: {ex.Message}");
+            CPH.LogWarn($"[Bankheist] Scheduled update check skipped: {SanitizeLogText(ex.Message)}");
         }
     }
 
     private void RunUpdateCheck(string usedCommand, string lang, bool isManualCommand)
     {
         CPH.SetGlobalVar(VarScriptVersion, ScriptVersion, true);
-        CPH.SetGlobalVar(VarLastUpdateCheckIso, DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture), true);
+        CPH.SetGlobalVar(VarLastUpdateCheckIso, GetUtcNow().ToString("o", CultureInfo.InvariantCulture), true);
 
         try
         {
@@ -777,14 +856,12 @@ public class CPHInline
 
             JObject obj = JObject.Parse(json);
             string tagName = obj["tag_name"] != null ? obj["tag_name"].ToString().Trim() : "";
-            string releaseUrl = obj["html_url"] != null ? obj["html_url"].ToString().Trim() : GitHubReleasesFallbackUrl;
-            if (string.IsNullOrEmpty(releaseUrl))
-                releaseUrl = GitHubReleasesFallbackUrl;
-
+            string releaseUrl = ValidateReleaseUrl(obj["html_url"] != null ? obj["html_url"].ToString().Trim() : "");
             string cleanLatest = NormalizeVersionString(tagName);
-            if (string.IsNullOrEmpty(cleanLatest))
+
+            if (!IsSafeCleanVersion(cleanLatest))
             {
-                CPH.LogWarn($"[Bankheist] Update check returned empty tag_name. Current version: v{ScriptVersion}");
+                CPH.LogWarn($"[Bankheist] Update check returned invalid tag_name '{SanitizeLogText(tagName)}'. Current version: v{ScriptVersion}");
                 if (isManualCommand)
                 {
                     string msgFailed = Msg("heistMsgUpdateCheckFailed", lang);
@@ -833,7 +910,7 @@ public class CPHInline
         }
         catch (Exception ex)
         {
-            CPH.LogWarn($"[Bankheist] Update check failed: {ex.Message}");
+            CPH.LogWarn($"[Bankheist] Update check failed: {SanitizeLogText(ex.Message)}");
             if (isManualCommand)
             {
                 string msgFailed = Msg("heistMsgUpdateCheckFailed", lang);
@@ -845,10 +922,129 @@ public class CPHInline
         }
     }
 
+    // -------------------------------------------------------------------------
+    // PROTECTED VIRTUAL HOOKS (for deterministic C# unit tests)
+    // -------------------------------------------------------------------------
+    protected virtual DateTime GetUtcNow()
+    {
+        return DateTime.UtcNow;
+    }
+
     protected virtual string FetchLatestReleaseJson(string apiUrl, int timeoutMs)
+    {
+        return HttpGetBounded(apiUrl, "api.github.com", "application/vnd.github+json", timeoutMs, MaxReleaseJsonBytes);
+    }
+
+    protected virtual string DownloadImportString(string rawUrl, int timeoutMs)
+    {
+        return HttpGetBounded(rawUrl, "raw.githubusercontent.com", "text/plain", timeoutMs, MaxImportDownloadBytes);
+    }
+
+    protected virtual string GetUpdateOutputDirectory()
+    {
+        return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, UpdateDownloadFolderName);
+    }
+
+    protected virtual string GetOptionalGitHubToken()
+    {
+        // Export-safe private repo support: read optional Fine-Grained PAT ONLY from local file or env var,
+        // never from Streamer.bot arguments or global variables.
+        try
+        {
+            string outputDir = GetUpdateOutputDirectory();
+            if (!string.IsNullOrEmpty(outputDir))
+            {
+                string tokenPath = Path.Combine(outputDir, GitHubTokenFileName);
+                if (File.Exists(tokenPath))
+                {
+                    string fileToken = File.ReadAllText(tokenPath, Encoding.UTF8);
+                    string cleaned = StripControlChars(fileToken).Trim();
+                    if (!string.IsNullOrEmpty(cleaned))
+                        return cleaned;
+                }
+            }
+        }
+        catch
+        {
+            // Ignore local token file errors and continue unauthenticated
+        }
+
+        try
+        {
+            string envToken = Environment.GetEnvironmentVariable(GitHubTokenEnvVar);
+            string cleaned = StripControlChars(envToken).Trim();
+            if (!string.IsNullOrEmpty(cleaned))
+                return cleaned;
+        }
+        catch
+        {
+            // Ignore environment variable read errors
+        }
+
+        return "";
+    }
+
+    protected virtual bool TryCopyToClipboard(string text)
+    {
+        if (string.IsNullOrEmpty(text))
+            return false;
+
+        try
+        {
+            string systemDir = Environment.GetFolderPath(Environment.SpecialFolder.System);
+            string clipPath = !string.IsNullOrEmpty(systemDir) ? Path.Combine(systemDir, "clip.exe") : "clip.exe";
+            if (!File.Exists(clipPath))
+                return false;
+
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = clipPath,
+                UseShellExecute = false,
+                RedirectStandardInput = true,
+                CreateNoWindow = true
+            };
+
+            using (var process = Process.Start(startInfo))
+            {
+                if (process == null)
+                    return false;
+
+                using (StreamWriter writer = process.StandardInput)
+                {
+                    writer.Write(text);
+                }
+
+                if (!process.WaitForExit(3000))
+                {
+                    try { process.Kill(); } catch { }
+                    return false;
+                }
+
+                return process.ExitCode == 0;
+            }
+        }
+        catch (Exception ex)
+        {
+            CPH.LogWarn($"[Bankheist] Could not copy import string to clipboard: {SanitizeLogText(ex.Message)}");
+            return false;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // SECURITY & VALIDATION HELPERS
+    // -------------------------------------------------------------------------
+    private string HttpGetBounded(string url, string expectedHost, string acceptHeader, int timeoutMs, int maxBytes)
     {
         try
         {
+            if (!Uri.TryCreate(url, UriKind.Absolute, out Uri parsedUri) ||
+                !string.Equals(parsedUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(parsedUri.Host, expectedHost, StringComparison.OrdinalIgnoreCase))
+            {
+                CPH.LogError($"[Bankheist] Blocked unexpected URL/host: '{SanitizeLogText(url)}'");
+                return null;
+            }
+
             try
             {
                 ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
@@ -858,29 +1054,187 @@ public class CPHInline
                 // Ignore if OS/runtime restricts manual TLS configuration
             }
 
-            var request = (HttpWebRequest)WebRequest.Create(apiUrl);
+            var request = (HttpWebRequest)WebRequest.Create(parsedUri);
             request.Method = "GET";
-            request.Accept = "application/vnd.github+json";
-            request.UserAgent = "Streamer.bot-Bankheist/" + ScriptVersion;
+            if (!string.IsNullOrEmpty(acceptHeader))
+                request.Accept = acceptHeader;
+            request.UserAgent = "Streamer.bot-" + GitHubRepoName + "/" + ScriptVersion;
             request.Timeout = timeoutMs;
             request.ReadWriteTimeout = timeoutMs;
 
-            using (var response = (HttpWebResponse)request.GetResponse())
-            using (var responseStream = response.GetResponseStream())
+            // Attach optional private-repo Bearer token ONLY for whitelisted GitHub hosts
+            if (string.Equals(parsedUri.Host, "api.github.com", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(parsedUri.Host, "raw.githubusercontent.com", StringComparison.OrdinalIgnoreCase))
             {
-                if (responseStream == null)
-                    return "";
+                string token = GetOptionalGitHubToken();
+                if (!string.IsNullOrEmpty(token))
+                    request.Headers["Authorization"] = "Bearer " + token;
+            }
 
-                using (var reader = new StreamReader(responseStream, Encoding.UTF8))
+            using (var response = (HttpWebResponse)request.GetResponse())
+            {
+                Uri finalUri = response.ResponseUri;
+                if (finalUri == null ||
+                    !string.Equals(finalUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ||
+                    (!string.Equals(finalUri.Host, expectedHost, StringComparison.OrdinalIgnoreCase) &&
+                     !finalUri.Host.EndsWith(".githubusercontent.com", StringComparison.OrdinalIgnoreCase)))
                 {
-                    return reader.ReadToEnd();
+                    CPH.LogError("[Bankheist] Blocked unexpected HTTP redirect target.");
+                    return null;
+                }
+
+                using (var responseStream = response.GetResponseStream())
+                {
+                    return responseStream == null ? "" : ReadStreamBoundedUtf8(responseStream, maxBytes);
                 }
             }
         }
         catch (Exception ex)
         {
-            CPH.LogWarn($"[Bankheist] GitHub release check HTTP error: {ex.Message}");
+            CPH.LogWarn($"[Bankheist] HTTP GET failed for '{expectedHost}': {SanitizeLogText(ex.Message)}");
             return null;
+        }
+    }
+
+    private string ReadStreamBoundedUtf8(Stream stream, int maxBytes)
+    {
+        using (var ms = new MemoryStream())
+        {
+            byte[] buffer = new byte[8192];
+            int totalRead = 0;
+            int read;
+            while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                totalRead += read;
+                if (totalRead > maxBytes)
+                    throw new InvalidOperationException("HTTP response exceeded maximum allowed size.");
+                ms.Write(buffer, 0, read);
+            }
+            return Encoding.UTF8.GetString(ms.ToArray());
+        }
+    }
+
+    private bool ValidateStreamerBotImportPayload(string importContent, out string error)
+    {
+        error = null;
+        if (string.IsNullOrEmpty(importContent) || !importContent.StartsWith("U0JBRR", StringComparison.Ordinal))
+        {
+            error = "Missing Streamer.bot SBAE header.";
+            return false;
+        }
+
+        if (importContent.Length > MaxImportDownloadBytes)
+        {
+            error = "Import string exceeds maximum allowed length.";
+            return false;
+        }
+
+        try
+        {
+            byte[] rawBytes = Convert.FromBase64String(importContent);
+            if (rawBytes.Length < 14 ||
+                rawBytes[0] != (byte)'S' || rawBytes[1] != (byte)'B' ||
+                rawBytes[2] != (byte)'A' || rawBytes[3] != (byte)'E' ||
+                rawBytes[4] != 0x1F || rawBytes[5] != 0x8B)
+            {
+                error = "Invalid SBAE/GZip binary header.";
+                return false;
+            }
+
+            string jsonText;
+            using (var inputMs = new MemoryStream(rawBytes, 4, rawBytes.Length - 4))
+            using (var gzip = new GZipStream(inputMs, CompressionMode.Decompress))
+            {
+                jsonText = ReadStreamBoundedUtf8(gzip, MaxImportDecompressedBytes);
+            }
+
+            JObject parsed = JObject.Parse(jsonText);
+            if (parsed["version"] == null || parsed["meta"] == null || parsed["data"] == null)
+            {
+                error = "Decompressed JSON missing required 'version', 'meta', or 'data' fields.";
+                return false;
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return false;
+        }
+    }
+
+    private string ValidateReleaseUrl(string rawUrl)
+    {
+        if (!string.IsNullOrEmpty(rawUrl) &&
+            rawUrl.StartsWith(GitHubReleaseUrlPrefix, StringComparison.OrdinalIgnoreCase) &&
+            Uri.TryCreate(rawUrl, UriKind.Absolute, out Uri uri) &&
+            string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+        {
+            return rawUrl;
+        }
+        return GitHubReleasesFallbackUrl;
+    }
+
+    private bool IsSafeTagName(string tagName)
+    {
+        return !string.IsNullOrEmpty(tagName) && tagName.Length <= 32 && StrictTagNameRegex.IsMatch(tagName);
+    }
+
+    private bool IsSafeCleanVersion(string cleanVersion)
+    {
+        return !string.IsNullOrEmpty(cleanVersion) && cleanVersion.Length <= 24 && StrictCleanVersionRegex.IsMatch(cleanVersion);
+    }
+
+    private bool IsManualUpdateRateLimited()
+    {
+        string raw = GetGlobalStringRaw(VarLastManualUpdateIso);
+        if (TryParseIsoUtc(raw, out DateTime lastUtc))
+        {
+            double delta = (GetUtcNow() - lastUtc).TotalSeconds;
+            return delta >= 0 && delta < ManualUpdateCooldownSeconds;
+        }
+        return false;
+    }
+
+    private string FormatChatSafePath(string fullPath, bool isDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(fullPath))
+            return isDirectory ? ".\\" : "";
+
+        try
+        {
+            string normalizedTarget = Path.GetFullPath(fullPath).TrimEnd('\\', '/');
+            string baseDirRaw = AppDomain.CurrentDomain.BaseDirectory;
+            if (!string.IsNullOrWhiteSpace(baseDirRaw))
+            {
+                string baseDir = Path.GetFullPath(baseDirRaw).TrimEnd('\\', '/');
+                string basePrefix = baseDir + Path.DirectorySeparatorChar;
+                if (normalizedTarget.StartsWith(basePrefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    string rel = normalizedTarget.Substring(basePrefix.Length).Replace('/', '\\').Trim('\\');
+                    string baseFolderName = Path.GetFileName(baseDir);
+                    string combined = !string.IsNullOrEmpty(baseFolderName) ? ".\\" + baseFolderName + "\\" + rel : ".\\" + rel;
+                    return isDirectory ? combined + "\\" : combined;
+                }
+            }
+
+            if (isDirectory)
+            {
+                string leaf = Path.GetFileName(normalizedTarget);
+                return !string.IsNullOrEmpty(leaf) ? ".\\" + leaf + "\\" : ".\\";
+            }
+
+            string fileName = Path.GetFileName(normalizedTarget);
+            string parentDir = Path.GetDirectoryName(normalizedTarget);
+            string parentName = !string.IsNullOrEmpty(parentDir) ? Path.GetFileName(parentDir.TrimEnd('\\', '/')) : "";
+            return !string.IsNullOrEmpty(parentName) && !string.IsNullOrEmpty(fileName)
+                ? ".\\" + parentName + "\\" + fileName
+                : (!string.IsNullOrEmpty(fileName) ? ".\\" + fileName : ".\\");
+        }
+        catch
+        {
+            return isDirectory ? ".\\" + UpdateDownloadFolderName + "\\" : "update.sb";
         }
     }
 
@@ -914,18 +1268,61 @@ public class CPHInline
         return false;
     }
 
+    private string StripControlChars(string input)
+    {
+        if (string.IsNullOrEmpty(input))
+            return "";
+
+        var sb = new StringBuilder(input.Length);
+        for (int i = 0; i < input.Length; i++)
+        {
+            char c = input[i];
+            if (c == '\r' || c == '\n' || c == '\t')
+                sb.Append(' ');
+            else if (!char.IsControl(c))
+                sb.Append(c);
+        }
+        return sb.ToString();
+    }
+
+    private string SanitizeLogText(string input)
+    {
+        string cleaned = StripControlChars(input).Trim();
+        if (cleaned.Length > 300)
+            cleaned = cleaned.Substring(0, 300) + "...";
+        return cleaned;
+    }
+
+    private string SanitizeUserName(string userName)
+    {
+        string cleaned = StripControlChars(userName).Trim();
+        if (cleaned.Length > 64)
+            cleaned = cleaned.Substring(0, 64);
+        return cleaned;
+    }
+
     private void SafeSendMessage(string message)
     {
         if (string.IsNullOrEmpty(message))
             return;
 
+        string sanitized = StripControlChars(message).Trim();
+        if (string.IsNullOrEmpty(sanitized))
+            return;
+
+        if (sanitized.StartsWith("/", StringComparison.Ordinal) || sanitized.StartsWith(".", StringComparison.Ordinal))
+            sanitized = "[Bankheist] " + sanitized;
+
+        if (sanitized.Length > MaxChatMessageLength)
+            sanitized = sanitized.Substring(0, MaxChatMessageLength);
+
         try
         {
-            CPH.SendMessage(message, true);
+            CPH.SendMessage(sanitized, true);
         }
         catch (Exception ex)
         {
-            CPH.LogWarn($"[Bankheist] Could not send chat notification (Twitch chat may not be connected yet): {ex.Message}");
+            CPH.LogWarn($"[Bankheist] Could not send chat notification (Twitch chat may not be connected yet): {SanitizeLogText(ex.Message)}");
         }
     }
 
@@ -942,7 +1339,7 @@ public class CPHInline
     private void ProcessStatus(string usedCommand, int joinTimeSec, int cooldownSec, long minBet, long maxBet, string lang)
     {
         string userId = GetArgString("userId");
-        string userName = GetArgString("user");
+        string userName = SanitizeUserName(GetArgString("user"));
         bool isLobbyActive = CPH.GetGlobalVar<bool>(VarHeistActive, false);
 
         if (isLobbyActive)
@@ -953,7 +1350,7 @@ public class CPHInline
 
             if (TryParseIsoUtc(rawIsoTime, out DateTime startTimeUtc))
             {
-                int elapsed = (int)(DateTime.UtcNow - startTimeUtc).TotalSeconds;
+                int elapsed = (int)(GetUtcNow() - startTimeUtc).TotalSeconds;
                 remainingSec = Math.Max(0, joinTimeSec - elapsed);
             }
 
@@ -993,29 +1390,27 @@ public class CPHInline
                 .Replace("%user%", userName)
                 .Replace("%command%", usedCommand);
 
-            CPH.SendMessage(msg, true);
+            SafeSendMessage(msg);
             return;
         }
 
         if (TryGetRemainingCooldown(cooldownSec, out int remainingCooldown))
         {
             string msgCooldown = Msg("heistMsgStatusCooldown", lang);
-            CPH.SendMessage(
+            SafeSendMessage(
                 msgCooldown
                     .Replace("%cooldown%", remainingCooldown.ToString(CultureInfo.InvariantCulture))
-                    .Replace("%command%", usedCommand),
-                true);
+                    .Replace("%command%", usedCommand));
             return;
         }
 
         string msgIdle = Msg("heistMsgStatusIdle", lang);
-        CPH.SendMessage(
+        SafeSendMessage(
             msgIdle
                 .Replace("%command%", usedCommand)
                 .Replace("%user%", userName)
                 .Replace("%min%", minBet.ToString(CultureInfo.InvariantCulture))
-                .Replace("%max%", maxBet.ToString(CultureInfo.InvariantCulture)),
-            true);
+                .Replace("%max%", maxBet.ToString(CultureInfo.InvariantCulture)));
     }
 
     private void SyncSettingsFromArgs(string lang)
@@ -1062,7 +1457,7 @@ public class CPHInline
 
     private void RunFullSetup(string usedCommand, string lang)
     {
-        CPH.SendMessage(Msg("heistMsgSetupStarted", lang), true);
+        SafeSendMessage(Msg("heistMsgSetupStarted", lang));
 
         GetLanguage();
         GetPointsSystem();
@@ -1101,7 +1496,10 @@ public class CPHInline
         }
 
         ClearLobbyState();
-        CPH.SetGlobalVar(VarCooldownActive, false, false);
+        lock (StateLock)
+        {
+            CPH.SetGlobalVar(VarCooldownActive, false, false);
+        }
 
         ConfigureTimerInterval(joinTimerId, joinTime);
         if (cooldownTime > 0)
@@ -1110,7 +1508,7 @@ public class CPHInline
         StopTimer(joinTimerId, DefaultJoinTimerName);
         StopTimer(cooldownTimerId, DefaultCooldownTimerName);
 
-        CPH.SendMessage(Msg("heistMsgSetupCompleted", lang), true);
+        SafeSendMessage(Msg("heistMsgSetupCompleted", lang));
 
         if (IsConfigBoolTrue("heistCheckForUpdates", true))
             RunUpdateCheck(usedCommand, lang, isManualCommand: false);
@@ -1130,7 +1528,7 @@ public class CPHInline
         }
         catch (Exception ex)
         {
-            CPH.LogError($"[Bankheist] Failed to deserialize participants: {ex.Message}");
+            CPH.LogError($"[Bankheist] Failed to deserialize participants: {SanitizeLogText(ex.Message)}");
         }
 
         return new Dictionary<string, HeistParticipant>(StringComparer.OrdinalIgnoreCase);
@@ -1145,15 +1543,18 @@ public class CPHInline
         }
         catch (Exception ex)
         {
-            CPH.LogError($"[Bankheist] Failed to serialize participants: {ex.Message}");
+            CPH.LogError($"[Bankheist] Failed to serialize participants: {SanitizeLogText(ex.Message)}");
         }
     }
 
     private void ClearLobbyState()
     {
-        CPH.SetGlobalVar(VarHeistActive, false, false);
-        CPH.UnsetGlobalVar(VarParticipants, false);
-        CPH.UnsetGlobalVar(VarStartTimeIso, false);
+        lock (StateLock)
+        {
+            CPH.SetGlobalVar(VarHeistActive, false, false);
+            CPH.UnsetGlobalVar(VarParticipants, false);
+            CPH.UnsetGlobalVar(VarStartTimeIso, false);
+        }
     }
 
     private bool TryGetRemainingCooldown(int cooldownSeconds, out int remainingSeconds)
@@ -1174,7 +1575,7 @@ public class CPHInline
 
         if (TryParseIsoUtc(rawLastRun, out DateTime lastRunUtc))
         {
-            int elapsed = (int)(DateTime.UtcNow - lastRunUtc).TotalSeconds;
+            int elapsed = (int)(GetUtcNow() - lastRunUtc).TotalSeconds;
             remaining = cooldownSeconds - elapsed;
             if (remaining <= 0)
             {
@@ -1623,6 +2024,12 @@ public class CPHInline
         return "de";
     }
 
+    private string GetStoredLanguageFast()
+    {
+        string globalLang = GetGlobalStringRaw("heistLanguage");
+        return !string.IsNullOrEmpty(globalLang) ? NormalizeLanguage(globalLang) : "de";
+    }
+
     private string NormalizeLanguage(string raw)
     {
         if (string.IsNullOrEmpty(raw))
@@ -1648,11 +2055,13 @@ public class CPHInline
             case "spanish":
             case "espanol":
             case "español":
+            case "esp":
                 return "es";
             case "fr":
             case "french":
             case "francais":
             case "français":
+            case "fra":
                 return "fr";
             case "pt":
             case "ptbr":
@@ -1660,22 +2069,26 @@ public class CPHInline
             case "portuguese":
             case "portugues":
             case "português":
+            case "por":
                 return "pt-br";
             case "tr":
             case "turkish":
             case "turkce":
             case "türkçe":
+            case "tur":
                 return "tr";
             case "nl":
             case "dutch":
             case "nederlands":
+            case "nld":
                 return "nl";
             case "pl":
             case "polish":
             case "polski":
+            case "pol":
                 return "pl";
             default:
-                return "en";
+                return "de";
         }
     }
 
