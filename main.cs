@@ -15,7 +15,7 @@ public class CPHInline
     // =========================================================================
     // CONSTANTS & MODELS
     // =========================================================================
-    private const string ScriptVersion = "2.4.0";
+    private const string ScriptVersion = "2.5.0";
     private const string GitHubRepoOwner = "neoshadow02";
     private const string GitHubRepoName = "sbot_bankheist";
     private const string GitHubLatestReleaseUrl = "https://api.github.com/repos/" + GitHubRepoOwner + "/" + GitHubRepoName + "/releases/latest";
@@ -103,6 +103,7 @@ public class CPHInline
         if (string.IsNullOrEmpty(usedCommand))
             usedCommand = DefaultCommand;
 
+        string usedCommandLower = usedCommand.ToLowerInvariant();
         string rawInput = GetArgString("rawInput").ToLowerInvariant();
         string[] inputTokens = rawInput.Split(new char[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
         string lang = GetLanguage();
@@ -110,6 +111,27 @@ public class CPHInline
         // Sync any settings passed via Sub-Action arguments into persistent globals
         // so timer-triggered methods (ExecuteHeist / ResetCooldown / CheckForUpdate) always see fresh values
         SyncSettingsFromArgs(lang);
+
+        // Canonical standalone update commands if bound directly to Execute() (e.g. "!heistGetUpdate", "!heistUpdate")
+        if (usedCommandLower.EndsWith("getupdate", StringComparison.Ordinal))
+        {
+            ParseUpdateDownloadFlags(rawInput, out bool forceCmd, out bool fullCmd);
+            HandleGetUpdateCommand(usedCommand, lang, forceCmd, fullCmd);
+            return true;
+        }
+
+        if (usedCommandLower.EndsWith("update", StringComparison.Ordinal))
+        {
+            if (inputTokens.Length > 0 && (inputTokens[0] == "get" || inputTokens[0] == "getupdate" || inputTokens[0] == "download"))
+            {
+                ParseUpdateDownloadFlags(rawInput, out bool forceCmdAlias, out bool fullCmdAlias);
+                HandleGetUpdateCommand(usedCommand, lang, forceCmdAlias, fullCmdAlias);
+                return true;
+            }
+
+            HandleUpdateCommand(usedCommand, lang);
+            return true;
+        }
 
         // Setup trigger
         string statusParam = GetArgString("status").ToLowerInvariant();
@@ -119,7 +141,8 @@ public class CPHInline
             return true;
         }
 
-        // Manual update / version check & download aliases (e.g. "!heist update", "!heist version", "!heist update get [force] [full]")
+        // Subcommand update / version check & download aliases (Broadcaster / Editor test only):
+        //   "!heist update", "!heist version", "!heist update get [force] [full]"
         if (inputTokens.Length > 0 && (inputTokens[0] == "update" || inputTokens[0] == "version"))
         {
             if (inputTokens.Length >= 2 && (inputTokens[1] == "get" || inputTokens[1] == "getupdate" || inputTokens[1] == "download"))
@@ -133,7 +156,7 @@ public class CPHInline
             return true;
         }
 
-        // 1-Click Update Download (Broadcaster / Editor test only):
+        // Subcommand 1-Click Update Download (Broadcaster / Editor test only):
         //   !heist getupdate [force] [full]
         if (inputTokens.Length > 0 && inputTokens[0] == "getupdate")
         {
@@ -624,7 +647,7 @@ public class CPHInline
 
     private void HandleUpdateCommand(string usedCommand, string lang)
     {
-        if (!HasAdminPermission(out string userName))
+        if (!HasBroadcasterPermission(out string userName))
         {
             string msgDenied = Msg("heistMsgUpdateDenied", lang);
             SafeSendMessage(
@@ -2256,7 +2279,7 @@ public class CPHInline
             case "heistMsgUpdateCheckFailed":
                 return "⚠️ Update-Prüfung fehlgeschlagen (aktuell: v%currentVersion%). Details im Streamer.bot-Log.";
             case "heistMsgUpdateDenied":
-                return "❌ %user%, du hast keine Berechtigung, den Update-Check für %command% auszuführen! (Nur Moderatoren/Broadcaster)";
+                return "❌ %user%, nur der Broadcaster darf den Update-Check ausführen!";
             case "heistMsgUpdateDownloadSuccess":
                 return "📦 Update v%latestVersion% gespeichert (%filePath%) & in die Zwischenablage kopiert! In Streamer.bot: Import → Strg+V → Import.";
             case "heistMsgUpdateDownloadFileOnly":
@@ -2264,7 +2287,7 @@ public class CPHInline
             case "heistMsgUpdateDownloadFailed":
                 return "❌ Download von Update v%latestVersion% fehlgeschlagen. Details im Streamer.bot-Log.";
             case "heistMsgUpdateDownloadDenied":
-                return "❌ %user%, nur der Broadcaster darf %command% getupdate ausführen!";
+                return "❌ %user%, nur der Broadcaster darf das Update herunterladen!";
             case "heistWordPoints":
                 return "Punkte";
             default:
@@ -2327,7 +2350,7 @@ public class CPHInline
             case "heistMsgUpdateCheckFailed":
                 return "⚠️ Update check failed (current: v%currentVersion%). Check the Streamer.bot log for details.";
             case "heistMsgUpdateDenied":
-                return "❌ %user%, you are not allowed to run the update check for %command%! (Moderators/Broadcaster only)";
+                return "❌ %user%, only the broadcaster is allowed to run the update check!";
             case "heistMsgUpdateDownloadSuccess":
                 return "📦 Update v%latestVersion% saved (%filePath%) & copied to clipboard! In Streamer.bot: Import → Ctrl+V → Import.";
             case "heistMsgUpdateDownloadFileOnly":
@@ -2335,7 +2358,7 @@ public class CPHInline
             case "heistMsgUpdateDownloadFailed":
                 return "❌ Failed to download update v%latestVersion%. Check the Streamer.bot log for details.";
             case "heistMsgUpdateDownloadDenied":
-                return "❌ %user%, only the broadcaster is allowed to run %command% getupdate!";
+                return "❌ %user%, only the broadcaster is allowed to download updates!";
             case "heistWordPoints":
                 return "points";
             default:
@@ -2398,7 +2421,7 @@ public class CPHInline
             case "heistMsgUpdateCheckFailed":
                 return "⚠️ Error al comprobar actualizaciones (actual: v%currentVersion%). Revisa el registro de Streamer.bot.";
             case "heistMsgUpdateDenied":
-                return "❌ %user%, no tienes permiso para comprobar actualizaciones de %command%. (Solo moderadores/broadcaster)";
+                return "❌ %user%, ¡solo el broadcaster puede comprobar actualizaciones!";
             case "heistMsgUpdateDownloadSuccess":
                 return "📦 Actualización v%latestVersion% guardada (%filePath%) y copiada al portapapeles. En Streamer.bot: Import → Ctrl+V → Import.";
             case "heistMsgUpdateDownloadFileOnly":
@@ -2406,7 +2429,7 @@ public class CPHInline
             case "heistMsgUpdateDownloadFailed":
                 return "❌ Error al descargar la actualización v%latestVersion%. Revisa el registro de Streamer.bot.";
             case "heistMsgUpdateDownloadDenied":
-                return "❌ %user%, solo el broadcaster puede ejecutar %command% getupdate.";
+                return "❌ %user%, ¡solo el broadcaster puede descargar actualizaciones!";
             case "heistWordPoints":
                 return "puntos";
             default:
@@ -2469,7 +2492,7 @@ public class CPHInline
             case "heistMsgUpdateCheckFailed":
                 return "⚠️ Échec de la vérification de mise à jour (actuelle : v%currentVersion%). Voir les logs Streamer.bot.";
             case "heistMsgUpdateDenied":
-                return "❌ %user%, tu n'as pas l'autorisation de vérifier les mises à jour pour %command% ! (Modérateurs/Broadcaster uniquement)";
+                return "❌ %user%, seul le broadcaster peut vérifier les mises à jour !";
             case "heistMsgUpdateDownloadSuccess":
                 return "📦 Mise à jour v%latestVersion% enregistrée (%filePath%) et copiée dans le presse-papiers ! Dans Streamer.bot : Import → Ctrl+V → Import.";
             case "heistMsgUpdateDownloadFileOnly":
@@ -2477,7 +2500,7 @@ public class CPHInline
             case "heistMsgUpdateDownloadFailed":
                 return "❌ Échec du téléchargement de la mise à jour v%latestVersion%. Voir les logs Streamer.bot.";
             case "heistMsgUpdateDownloadDenied":
-                return "❌ %user%, seul le broadcaster peut exécuter %command% getupdate !";
+                return "❌ %user%, seul le broadcaster peut télécharger les mises à jour !";
             case "heistWordPoints":
                 return "points";
             default:
@@ -2540,7 +2563,7 @@ public class CPHInline
             case "heistMsgUpdateCheckFailed":
                 return "⚠️ Falha ao verificar atualizações (atual: v%currentVersion%). Veja o log do Streamer.bot.";
             case "heistMsgUpdateDenied":
-                return "❌ %user%, você não tem permissão para verificar atualizações de %command%! (Somente moderadores/broadcaster)";
+                return "❌ %user%, apenas o broadcaster pode verificar atualizações!";
             case "heistMsgUpdateDownloadSuccess":
                 return "📦 Atualização v%latestVersion% salva (%filePath%) e copiada para a área de transferência! No Streamer.bot: Import → Ctrl+V → Import.";
             case "heistMsgUpdateDownloadFileOnly":
@@ -2548,7 +2571,7 @@ public class CPHInline
             case "heistMsgUpdateDownloadFailed":
                 return "❌ Falha ao baixar a atualização v%latestVersion%. Veja o log do Streamer.bot.";
             case "heistMsgUpdateDownloadDenied":
-                return "❌ %user%, somente o broadcaster pode executar %command% getupdate!";
+                return "❌ %user%, apenas o broadcaster pode baixar atualizações!";
             case "heistWordPoints":
                 return "pontos";
             default:
@@ -2611,7 +2634,7 @@ public class CPHInline
             case "heistMsgUpdateCheckFailed":
                 return "⚠️ Güncelleme kontrolü başarısız (mevcut: v%currentVersion%). Detaylar Streamer.bot günlüğünde.";
             case "heistMsgUpdateDenied":
-                return "❌ %user%, %command% güncelleme kontrolünü çalıştırma iznin yok! (Sadece moderatörler/yayıncı)";
+                return "❌ %user%, güncelleme kontrolünü sadece yayıncı çalıştırabilir!";
             case "heistMsgUpdateDownloadSuccess":
                 return "📦 v%latestVersion% güncellemesi kaydedildi (%filePath%) ve panoya kopyalandı! Streamer.bot: Import → Ctrl+V → Import.";
             case "heistMsgUpdateDownloadFileOnly":
@@ -2619,7 +2642,7 @@ public class CPHInline
             case "heistMsgUpdateDownloadFailed":
                 return "❌ v%latestVersion% güncellemesi indirilemedi. Detaylar Streamer.bot günlüğünde.";
             case "heistMsgUpdateDownloadDenied":
-                return "❌ %user%, %command% getupdate komutunu sadece yayıncı çalıştırabilir!";
+                return "❌ %user%, güncellemeleri sadece yayıncı indirebilir!";
             case "heistWordPoints":
                 return "puan";
             default:
@@ -2682,7 +2705,7 @@ public class CPHInline
             case "heistMsgUpdateCheckFailed":
                 return "⚠️ Updatecontrole mislukt (huidig: v%currentVersion%). Bekijk het Streamer.bot-logboek.";
             case "heistMsgUpdateDenied":
-                return "❌ %user%, je mag de updatecontrole voor %command% niet uitvoeren! (Alleen moderators/broadcaster)";
+                return "❌ %user%, alleen de broadcaster mag op updates controleren!";
             case "heistMsgUpdateDownloadSuccess":
                 return "📦 Update v%latestVersion% opgeslagen (%filePath%) en naar het klembord gekopieerd! In Streamer.bot: Import → Ctrl+V → Import.";
             case "heistMsgUpdateDownloadFileOnly":
@@ -2690,7 +2713,7 @@ public class CPHInline
             case "heistMsgUpdateDownloadFailed":
                 return "❌ Downloaden van update v%latestVersion% mislukt. Bekijk het Streamer.bot-logboek.";
             case "heistMsgUpdateDownloadDenied":
-                return "❌ %user%, alleen de broadcaster mag %command% getupdate uitvoeren!";
+                return "❌ %user%, alleen de broadcaster mag updates downloaden!";
             case "heistWordPoints":
                 return "punten";
             default:
@@ -2753,7 +2776,7 @@ public class CPHInline
             case "heistMsgUpdateCheckFailed":
                 return "⚠️ Sprawdzanie aktualizacji nie powiodło się (obecna: v%currentVersion%). Sprawdź log Streamer.bot.";
             case "heistMsgUpdateDenied":
-                return "❌ %user%, nie masz uprawnień do sprawdzenia aktualizacji %command%! (Tylko moderatorzy/broadcaster)";
+                return "❌ %user%, tylko streamer może sprawdzać aktualizacje!";
             case "heistMsgUpdateDownloadSuccess":
                 return "📦 Aktualizacja v%latestVersion% zapisana (%filePath%) i skopiowana do schowka! W Streamer.bot: Import → Ctrl+V → Import.";
             case "heistMsgUpdateDownloadFileOnly":
@@ -2761,7 +2784,7 @@ public class CPHInline
             case "heistMsgUpdateDownloadFailed":
                 return "❌ Pobieranie aktualizacji v%latestVersion% nie powiodło się. Sprawdź log Streamer.bot.";
             case "heistMsgUpdateDownloadDenied":
-                return "❌ %user%, tylko broadcaster może uruchomić %command% getupdate!";
+                return "❌ %user%, tylko streamer może pobierać aktualizacje!";
             case "heistWordPoints":
                 return "punkty";
             default:
