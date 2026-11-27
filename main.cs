@@ -15,7 +15,7 @@ public class CPHInline
     // =========================================================================
     // CONSTANTS & MODELS
     // =========================================================================
-    private const string ScriptVersion = "2.5.0";
+    private const string ScriptVersion = "2.5.1";
     private const string GitHubRepoOwner = "neoshadow02";
     private const string GitHubRepoName = "sbot_bankheist";
     private const string GitHubLatestReleaseUrl = "https://api.github.com/repos/" + GitHubRepoOwner + "/" + GitHubRepoName + "/releases/latest";
@@ -611,14 +611,105 @@ public class CPHInline
     // =========================================================================
     // COMMAND HANDLERS & UPDATE SYSTEM
     // =========================================================================
+    private bool IsCurrentUserBroadcaster()
+    {
+        // Shared Chat safety (Streamer.bot v1.0+): never treat a guest channel's broadcaster as our broadcaster
+        if (IsArgTrue("isFromSharedChatGuest"))
+            return false;
+
+        // 1. Explicit boolean flags (YouTube isOwner, custom/test triggers)
+        if (IsArgTrue("isBroadcaster") || IsArgTrue("isOwner") || IsArgTrue("isChannelOwner"))
+            return true;
+
+        // 2. Streamer.bot Twitch/Kick role argument (4 = Broadcaster, 3 = Moderator, 2 = VIP, 1 = Viewer)
+        string role = GetArgString("role");
+        if (role == "4" || string.Equals(role, "broadcaster", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // 3. Streamer.bot Command Triggered broadcaster variables (%broadcastUserId%, %broadcastUserName%, %broadcastUser%)
+        string userId = GetArgString("userId");
+        string userLogin = GetArgString("userName");
+        string userDisplay = GetArgString("user");
+        string effectiveLogin = !string.IsNullOrEmpty(userLogin) ? userLogin : userDisplay;
+
+        string bcId = GetArgString("broadcastUserId");
+        string bcLogin = GetArgString("broadcastUserName");
+        string bcDisplay = GetArgString("broadcastUser");
+
+        if (!string.IsNullOrEmpty(userId) && !string.IsNullOrEmpty(bcId))
+            return string.Equals(userId, bcId, StringComparison.OrdinalIgnoreCase);
+
+        if (!string.IsNullOrEmpty(effectiveLogin) && !string.IsNullOrEmpty(bcLogin))
+            return string.Equals(effectiveLogin, bcLogin, StringComparison.OrdinalIgnoreCase);
+
+        if (!string.IsNullOrEmpty(userDisplay) && !string.IsNullOrEmpty(bcDisplay))
+            return string.Equals(userDisplay, bcDisplay, StringComparison.OrdinalIgnoreCase);
+
+        // 4. Fallback: query connected Twitch broadcaster directly via CPH.TwitchGetBroadcaster()
+        return IsConnectedTwitchBroadcaster(userId, effectiveLogin, userDisplay);
+    }
+
+    protected virtual bool IsConnectedTwitchBroadcaster(string userId, string userLogin, string userDisplay)
+    {
+        try
+        {
+            string source = GetArgString("commandSource").ToLowerInvariant();
+            if (!string.IsNullOrEmpty(source) && source != "twitch")
+                return false;
+
+            var bc = CPH.TwitchGetBroadcaster();
+            if (bc == null)
+                return false;
+
+            if (!string.IsNullOrEmpty(userId) && !string.IsNullOrEmpty(bc.UserId))
+                return string.Equals(userId, bc.UserId, StringComparison.OrdinalIgnoreCase);
+
+            if (!string.IsNullOrEmpty(userLogin) && !string.IsNullOrEmpty(bc.UserLogin))
+                return string.Equals(userLogin, bc.UserLogin, StringComparison.OrdinalIgnoreCase);
+
+            if (!string.IsNullOrEmpty(userDisplay) && !string.IsNullOrEmpty(bc.UserName))
+                return string.Equals(userDisplay, bc.UserName, StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception ex)
+        {
+            CPH.LogWarn($"[Bankheist] TwitchGetBroadcaster fallback failed: {SanitizeLogText(ex.Message)}");
+        }
+
+        return false;
+    }
+
+    private bool IsCurrentUserMod()
+    {
+        if (IsArgTrue("isFromSharedChatGuest"))
+            return false;
+
+        if (IsArgTrue("isMod") || IsArgTrue("isModerator"))
+            return true;
+
+        string role = GetArgString("role");
+        return role == "3" ||
+               string.Equals(role, "moderator", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(role, "mod", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool IsCurrentUserVip()
+    {
+        if (IsArgTrue("isFromSharedChatGuest"))
+            return false;
+
+        if (IsArgTrue("isVip"))
+            return true;
+
+        string role = GetArgString("role");
+        return role == "2" || string.Equals(role, "vip", StringComparison.OrdinalIgnoreCase);
+    }
+
     private bool HasAdminPermission(out string userName)
     {
         string userId = GetArgString("userId");
         userName = GetArgString("user");
         bool isDirectEditorTest = string.IsNullOrEmpty(userId) && string.IsNullOrEmpty(userName);
-        bool isBroadcaster = IsArgTrue("isBroadcaster") || IsArgTrue("isOwner");
-        bool isMod = IsArgTrue("isMod") || IsArgTrue("isModerator");
-        return isBroadcaster || isMod || isDirectEditorTest;
+        return IsCurrentUserBroadcaster() || IsCurrentUserMod() || isDirectEditorTest;
     }
 
     private void HandleSetupCommand(string usedCommand, string lang)
@@ -641,8 +732,7 @@ public class CPHInline
         string userId = GetArgString("userId");
         userName = GetArgString("user");
         bool isDirectEditorTest = string.IsNullOrEmpty(userId) && string.IsNullOrEmpty(userName);
-        bool isBroadcaster = IsArgTrue("isBroadcaster") || IsArgTrue("isOwner");
-        return isBroadcaster || isDirectEditorTest;
+        return IsCurrentUserBroadcaster() || isDirectEditorTest;
     }
 
     private void HandleUpdateCommand(string usedCommand, string lang)
@@ -1622,11 +1712,11 @@ public class CPHInline
 
     private string GetCurrentUserRole()
     {
-        if (IsArgTrue("isBroadcaster") || IsArgTrue("isOwner"))
+        if (IsCurrentUserBroadcaster())
             return RoleBroadcaster;
-        if (IsArgTrue("isMod") || IsArgTrue("isModerator"))
+        if (IsCurrentUserMod())
             return RoleMod;
-        if (IsArgTrue("isVip"))
+        if (IsCurrentUserVip())
             return RoleVip;
         return RoleUser;
     }
